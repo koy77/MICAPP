@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  micapp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: micapp
+    image: micapp:latest
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PULSE_SERVER=unix:/tmp/pulse-socket
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /tmp/pulse-socket:/tmp/pulse-socket
+      - ./recordings:/app/recordings
+      - $HOME/.Xauthority:/home/appuser/.Xauthority:ro
+    devices:
+      - /dev/snd:/dev/snd
+      - /dev/input:/dev/input
+    network_mode: host
+    privileged: false
+    stdin_open: true
+    tty: true
+    # user: "${UID:-1000}:${GID:-1000}"  # Commented out to use appuser from Dockerfile
+    security_opt:
+      - seccomp:unconfined
+    restart: unless-stopped
+    # Note: Make sure to run these commands before starting:
+    # xhost +local:docker
+    # pactl load-module module-native-protocol-unix socket=/tmp/pulse-socket
+

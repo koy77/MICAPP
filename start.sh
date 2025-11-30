@@ -38,14 +38,21 @@ command_exists() {
 check_prerequisites() {
     print_status "Checking prerequisites..."
     
-    # Check if Go is installed
-    if ! command_exists go; then
-        print_error "Go is not installed. Please install Go 1.19+ first."
+    # Check if Docker is installed
+    if ! command_exists docker; then
+        print_error "Docker is not installed. Please install Docker first."
         echo "Installation instructions:"
-        echo "  sudo apt update"
-        echo "  sudo apt install -y golang-go"
+        echo "  https://docs.docker.com/get-docker/"
         exit 1
     fi
+    
+    # Check if Docker is running
+    if ! docker info >/dev/null 2>&1; then
+        print_error "Docker is not running. Please start Docker daemon."
+        exit 1
+    fi
+    
+    print_success "Docker is installed and running"
     
     # Check if we're in the correct directory
     if [ ! -d "code" ]; then
@@ -53,15 +60,10 @@ check_prerequisites() {
         exit 1
     fi
     
-    # Check Go version
-    GO_VERSION=$(go version | grep -o 'go[0-9]\+\.[0-9]\+' | sed 's/go//')
-    REQUIRED_VERSION="1.19"
-    if [ "$(printf '%s\n' "$REQUIRED_VERSION" "$GO_VERSION" | sort -V | head -n1)" != "$REQUIRED_VERSION" ]; then
-        print_error "Go version $GO_VERSION is too old. Please install Go $REQUIRED_VERSION or later."
+    if [ ! -f "Dockerfile" ]; then
+        print_error "Dockerfile not found. Please run this script from the project root directory."
         exit 1
     fi
-    
-    print_success "Go version $GO_VERSION is installed"
     
     # Check if OPENAI_API_KEY is set
     if [ -z "$OPENAI_API_KEY" ]; then
@@ -81,27 +83,24 @@ check_prerequisites() {
     else
         print_success "OPENAI_API_KEY is set"
     fi
-    
-    # Check audio dependencies
-    print_status "Checking audio dependencies..."
-    if ! command_exists arecord; then
-        print_warning "Audio tools not found. You may need to install audio dependencies:"
-        echo "  sudo apt install -y libasound2-dev libpulse-dev portaudio19-dev"
-    else
-        print_success "Audio tools are available"
-    fi
 }
 
 # Function to install dependencies
 install_dependencies() {
-    print_status "Installing Go dependencies..."
+    print_status "Installing Go dependencies using Docker..."
     
     if [ ! -f "go.mod" ]; then
         print_error "go.mod not found. Are you in the correct directory?"
         exit 1
     fi
     
-    go mod tidy
+    # Use Docker to install dependencies
+    docker run --rm \
+        -v "$(pwd):/build" \
+        -w /build \
+        golang:1.23-bullseye \
+        go mod download
+    
     if [ $? -eq 0 ]; then
         print_success "Dependencies installed successfully"
     else
@@ -112,7 +111,7 @@ install_dependencies() {
 
 # Function to build the application
 build_app() {
-    print_status "Building VoiceTranscriber..."
+    print_status "Building VoiceTranscriber using Docker..."
     
     # Clean previous build
     if [ -f "voicetranscriber" ]; then
@@ -120,9 +119,28 @@ build_app() {
         print_status "Removed previous build"
     fi
     
-    # Build the application from the code directory
-    go build -ldflags="-s -w" -o voicetranscriber ./code
+    # Check if builder image exists, if not build it
+    if ! docker images | grep -q "micapp-builder"; then
+        print_status "Building Docker builder image..."
+        docker build --target builder -t micapp-builder:latest -f Dockerfile .
+        if [ $? -ne 0 ]; then
+            print_error "Failed to build Docker builder image"
+            exit 1
+        fi
+    fi
+    
+    # Build the application using Docker
+    print_status "Compiling application in Docker container..."
+    docker run --rm \
+        -v "$(pwd):/build" \
+        -w /build \
+        micapp-builder:latest \
+        sh -c "CGO_ENABLED=1 GOOS=linux go build -ldflags='-s -w' -o voicetranscriber ./code"
+    
     if [ $? -eq 0 ]; then
+        # Make executable
+        chmod +x voicetranscriber
+        
         print_success "Application built successfully"
         
         # Show build info
@@ -161,18 +179,20 @@ show_help() {
     echo ""
     echo "Options:"
     echo "  -h, --help     Show this help message"
-    echo "  -b, --build    Only build the application (don't run)"
+    echo "  -b, --build    Only build the application using Docker (don't run)"
     echo "  -r, --run      Only run the application (don't build)"
     echo "  -c, --clean    Clean build artifacts"
-    echo "  -d, --deps     Only install dependencies"
+    echo "  -d, --deps     Only install dependencies using Docker"
     echo ""
     echo "Environment Variables:"
     echo "  OPENAI_API_KEY    Your OpenAI API key (required)"
     echo ""
+    echo "Note: This script uses Docker for building. Make sure Docker is installed and running."
+    echo ""
     echo "Examples:"
-    echo "  $0                # Build and run"
-    echo "  $0 --build        # Only build"
-    echo "  $0 --run          # Only run"
+    echo "  $0                # Build (using Docker) and run"
+    echo "  $0 --build        # Only build using Docker"
+    echo "  $0 --run          # Only run (requires existing build)"
     echo "  $0 --clean        # Clean and rebuild"
 }
 
@@ -188,6 +208,14 @@ clean_build() {
     if [ -d ".voicetranscriber" ]; then
         rm -rf .voicetranscriber
         print_success "Removed application data directory"
+    fi
+    
+    # Optionally clean Docker builder image
+    read -p "Do you want to remove Docker builder image? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        docker rmi micapp-builder:latest 2>/dev/null || true
+        print_success "Removed Docker builder image"
     fi
     
     print_success "Clean completed"

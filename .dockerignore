@@ -1,0 +1,36 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+voicetranscriber
+*.o
+*.a
+
+# Logs
+*.log
+app.log
+
+# Recordings (will be mounted as volume)
+recordings/*
+
+# Documentation
+_docs/
+*.md
+!README.md
+
+# Scripts (not needed in container)
+build_and_run.sh
+start.sh
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
