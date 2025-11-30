@@ -1,0 +1,39 @@
+# VoiceTranscriber .gitignore
+
+# Audio recordings
+recordings/
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
+
+# Build artifacts
+voicetranscriber
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go build cache
+go.sum
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+app.log
+logs/
+*.log
+
+# Temporary files
+*.tmp
+*.temp

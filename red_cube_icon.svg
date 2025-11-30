@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- Фон -->
+  <rect width="64" height="64" fill="#2b2b2b" rx="8"/>
+  
+  <!-- Красный куб - передняя грань -->
+  <rect x="16" y="32" width="24" height="24" fill="#ff4444" stroke="#cc3333" stroke-width="1"/>
+  
+  <!-- Красный куб - верхняя грань -->
+  <polygon points="16,32 24,24 40,24 32,32" fill="#ff6666" stroke="#cc3333" stroke-width="1"/>
+  
+  <!-- Красный куб - боковая грань -->
+  <polygon points="40,24 40,48 32,56 32,32" fill="#cc3333" stroke="#cc3333" stroke-width="1"/>
+  
+  <!-- Блики на кубе -->
+  <rect x="18" y="34" width="6" height="6" fill="#ff8888" opacity="0.6"/>
+  <polygon points="18,34 22,30 26,30 22,34" fill="#ff8888" opacity="0.4"/>
+  
+  <!-- Тень -->
+  <ellipse cx="32" cy="58" rx="20" ry="4" fill="#000000" opacity="0.3"/>
+</svg>
