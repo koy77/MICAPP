@@ -10,77 +10,18 @@ Voice transcription application with GUI built with Go and Fyne framework.
 - Text correction using LLM
 - Screenshot capture functionality
 
-## Docker Setup (Recommended)
+## Quick Start
 
-The easiest way to run MICAPP is using Docker, which handles all dependencies automatically.
-
-### Prerequisites
-
-- Docker and Docker Compose installed
-- X11 server running (for GUI)
-- PulseAudio running (for audio)
-- OpenAI API key
-
-### Quick Start with Docker
-
-1. **Set your OpenAI API key:**
-   ```bash
-   export OPENAI_API_KEY="your-api-key-here"
-   ```
-
-2. **Allow X11 connections:**
-   ```bash
-   xhost +local:docker
-   ```
-
-3. **Setup PulseAudio socket (for audio):**
-   ```bash
-   pactl load-module module-native-protocol-unix socket=/tmp/pulse-socket
-   ```
-
-4. **Run the application:**
-   ```bash
-   ./docker-run.sh
-   ```
-
-   Or using docker-compose directly:
-   ```bash
-   docker-compose up
-   ```
-
-### Building Docker Image
-
-To build the Docker image manually:
-
+### Set your OpenAI API key (required for both methods):
 ```bash
-docker-compose build
+export OPENAI_API_KEY="your-api-key-here"
 ```
 
-Or using docker directly:
+---
 
-```bash
-docker build -t micapp:latest .
-```
+## Native Build (Recommended)
 
-### Running with Docker (without docker-compose)
-
-```bash
-docker run -it \
-  --rm \
-  -e DISPLAY=$DISPLAY \
-  -e OPENAI_API_KEY=$OPENAI_API_KEY \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-  -v /tmp/pulse-socket:/tmp/pulse-socket \
-  -v $(pwd)/recordings:/app/recordings \
-  --device /dev/snd \
-  --device /dev/input \
-  --network host \
-  micapp:latest
-```
-
-## Manual Setup (Without Docker)
-
-If you prefer to run without Docker, you'll need to install dependencies manually.
+Build and run directly on your host machine using Go.
 
 ### Prerequisites
 
@@ -89,12 +30,19 @@ If you prefer to run without Docker, you'll need to install dependencies manuall
 - X11 libraries for GUI
 - xclip, xdotool, wmctrl utilities
 
-### Installation
+### Install Dependencies (Ubuntu/Debian)
 
 1. **Install Go:**
    ```bash
-   sudo apt update
-   sudo apt install -y golang-go
+   wget https://go.dev/dl/go1.23.0.linux-amd64.tar.gz
+   sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go1.23.0.linux-amd64.tar.gz
+   ```
+
+   Add to `~/.bashrc`:
+   ```bash
+   export PATH=$PATH:/usr/local/go/bin
+   export GOPATH=$HOME/go
+   export PATH=$PATH:$GOPATH/bin
    ```
 
 2. **Install audio dependencies:**
@@ -114,25 +62,93 @@ If you prefer to run without Docker, you'll need to install dependencies manuall
    sudo apt install -y xclip xdotool wmctrl
    ```
 
-5. **Set OpenAI API key:**
+### Build & Run (Native)
+
+**Using the start script (recommended):**
+```bash
+./start.sh              # Build and run
+./start.sh --build      # Only build
+./start.sh --run        # Only run (requires existing build)
+./start.sh --deps       # Only install Go dependencies
+./start.sh --clean      # Clean build artifacts
+./start.sh --help       # Show all options
+```
+
+**Manual commands:**
+```bash
+# Install Go dependencies
+go mod download
+
+# Build the application
+CGO_ENABLED=1 go build -ldflags='-s -w' -o voicetranscriber ./code
+
+# Run the application
+./voicetranscriber
+```
+
+---
+
+## Docker Build
+
+Build and run using Docker containers. Handles all dependencies automatically.
+
+### Prerequisites
+
+- Docker and Docker Compose installed
+- X11 server running (for GUI)
+- PulseAudio running (for audio)
+
+### Setup X11 and Audio
+
+1. **Allow X11 connections:**
    ```bash
-   export OPENAI_API_KEY="your-api-key-here"
+   xhost +local:docker
    ```
 
-6. **Install Go dependencies:**
+2. **Setup PulseAudio socket (for audio):**
    ```bash
-   go mod download
+   pactl load-module module-native-protocol-unix socket=/tmp/pulse-socket
    ```
 
-7. **Build the application:**
-   ```bash
-   go build -o voicetranscriber ./code
-   ```
+### Build & Run (Docker)
 
-8. **Run the application:**
-   ```bash
-   ./voicetranscriber
-   ```
+**Using docker-compose (recommended):**
+```bash
+# Build and run
+docker-compose up
+
+# Build only
+docker-compose build
+
+# Run in background
+docker-compose up -d
+```
+
+**Using docker-run script:**
+```bash
+./docker-run.sh
+```
+
+**Using docker directly:**
+```bash
+# Build the image
+docker build -t micapp:latest .
+
+# Run the container
+docker run -it \
+  --rm \
+  -e DISPLAY=$DISPLAY \
+  -e OPENAI_API_KEY=$OPENAI_API_KEY \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  -v /tmp/pulse-socket:/tmp/pulse-socket \
+  -v $(pwd)/recordings:/app/recordings \
+  --device /dev/snd \
+  --device /dev/input \
+  --network host \
+  micapp:latest
+```
+
+---
 
 ## Usage
 
@@ -144,9 +160,26 @@ If you prefer to run without Docker, you'll need to install dependencies manuall
 
 ## Environment Variables
 
-- `OPENAI_API_KEY` - Required. Your OpenAI API key for transcription
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `OPENAI_API_KEY` | Yes | Your OpenAI API key for transcription |
 
 ## Troubleshooting
+
+### Native Build Issues
+
+**Build fails with CGO errors:**
+- Make sure GCC is installed: `sudo apt install build-essential`
+- Verify all dev libraries are installed (see prerequisites)
+
+**Audio recording fails:**
+- Check microphone permissions in system settings
+- Verify PulseAudio is running: `pulseaudio --check -v`
+- List audio devices: `arecord -l`
+
+**GUI not displaying:**
+- Check DISPLAY variable: `echo $DISPLAY`
+- Verify X11 is running: `xhost`
 
 ### Docker Issues
 
@@ -165,17 +198,6 @@ Make sure your user is in the `docker` group:
 ```bash
 sudo usermod -aG docker $USER
 ```
-
-### Manual Setup Issues
-
-**Audio recording fails:**
-- Check microphone permissions in system settings
-- Verify PulseAudio is running: `pulseaudio --check -v`
-- List audio devices: `arecord -l`
-
-**GUI not displaying:**
-- Check DISPLAY variable: `echo $DISPLAY`
-- Verify X11 is running: `xhost`
 
 ## License
 
