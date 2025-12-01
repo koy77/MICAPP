@@ -654,7 +654,13 @@ func (a *AppState) transcribeWithRetry(wavData []byte, filename string, language
 			return "", fmt.Errorf("transcription canceled")
 		}
 
-		transcription, err := a.openaiClient.Transcribe(wavData, filename, language)
+		// Callback to change indicator when upload is complete and waiting for response
+		onRequestSent := func() {
+			log.Printf("Upload complete, waiting for Whisper response...")
+			a.setFirstIndicatorDownload()
+		}
+
+		transcription, err := a.openaiClient.Transcribe(wavData, filename, language, onRequestSent)
 		if err == nil {
 			return transcription, nil
 		}
@@ -857,6 +863,26 @@ func (a *AppState) updateQueueIndicators() {
 		a.queueIndicators = append(a.queueIndicators, indicator)
 		a.queueContainer.Add(indicator)
 	}
+}
+
+// setFirstIndicatorDownload changes the first queue indicator to download icon
+// Called when upload is complete and waiting for response from server
+func (a *AppState) setFirstIndicatorDownload() {
+	if a.queueContainer == nil || len(a.queueIndicators) == 0 {
+		return
+	}
+
+	// Replace first indicator with download icon
+	downloadIcon := widget.NewIcon(theme.DownloadIcon())
+	downloadIcon.Resize(fyne.NewSize(16, 16))
+	a.queueIndicators[0] = downloadIcon
+
+	// Update container
+	a.queueContainer.RemoveAll()
+	for _, indicator := range a.queueIndicators {
+		a.queueContainer.Add(indicator)
+	}
+	a.queueContainer.Refresh()
 }
 
 // addToQueue adds a transcription request to the queue

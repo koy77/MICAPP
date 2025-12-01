@@ -56,11 +56,12 @@ func NewOpenAiSpeechClient() (*OpenAiSpeechClient, error) {
 //   - wavBytes: WAV file data as byte slice
 //   - filename: Filename for the multipart form (typically "recording.wav")
 //   - language: Language code (e.g., "ru" for Russian, "en" for English, "auto" for auto-detection)
+//   - onRequestSent: Optional callback called after request is sent, before waiting for response
 //
 // Returns:
 //   - string: Transcribed text
 //   - error: Any error that occurred during the API call
-func (c *OpenAiSpeechClient) Transcribe(wavBytes []byte, filename string, language string) (string, error) {
+func (c *OpenAiSpeechClient) Transcribe(wavBytes []byte, filename string, language string, onRequestSent ...func()) (string, error) {
 	// Create multipart form data
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
@@ -112,12 +113,17 @@ func (c *OpenAiSpeechClient) Transcribe(wavBytes []byte, filename string, langua
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	// Send request
+	// Send request (this uploads the audio file)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to send request: %v", err)
 	}
 	defer resp.Body.Close()
+
+	// Call callback after request is sent (now waiting for response/download)
+	if len(onRequestSent) > 0 && onRequestSent[0] != nil {
+		onRequestSent[0]()
+	}
 
 	// Read response body
 	body, err := io.ReadAll(resp.Body)
