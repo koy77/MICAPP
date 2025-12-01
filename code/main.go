@@ -747,40 +747,23 @@ func (a *AppState) processAudio() {
 		audioBytes[i*2+1] = byte((sample >> 8) & 0xFF)
 	}
 
-	// Check for cancel before storing
+	// Check for cancel before saving recording
 	a.processingMutex.Lock()
 	shouldCancel = a.shouldCancel
 	a.processingMutex.Unlock()
 	if shouldCancel {
-		log.Printf("processAudio: canceled before storing audio")
+		log.Printf("processAudio: canceled before saving recording")
 		setStatusText(a.statusLabel, "Processing canceled")
 		a.resetActiveButton()
 		return
 	}
 
-	// Store audio in different bitrates (synchronous)
-	storedFiles, err := a.audioStorage.StoreAudio(audioBytes, 16000)
-	if err != nil {
-		log.Printf("Failed to store audio: %v", err)
-	}
-
-	// Check for cancel before saving last recording
-	a.processingMutex.Lock()
-	shouldCancel = a.shouldCancel
-	a.processingMutex.Unlock()
-	if shouldCancel {
-		log.Printf("processAudio: canceled before saving last recording")
-		setStatusText(a.statusLabel, "Processing canceled")
-		a.resetActiveButton()
-		return
-	}
-
-	// Save the last recording to recordings folder (synchronous)
+	// Save the recording to recordings folder (MP3 128kbps only)
 	lastRecording, err := a.audioStorage.SaveLastRecording(audioBytes, 16000)
 	if err != nil {
-		log.Printf("Failed to save last recording: %v", err)
+		log.Printf("Failed to save recording: %v", err)
 	} else {
-		log.Printf("Last recording saved as: %s", lastRecording)
+		log.Printf("Recording saved as: %s", lastRecording)
 	}
 
 	// Check for cancel before adding to queue
@@ -800,11 +783,6 @@ func (a *AppState) processAudio() {
 
 	// Update stored audio list
 	a.updateStoredAudioList()
-
-	// Log stored files
-	if len(storedFiles) > 0 {
-		log.Printf("Stored %d audio files with different bitrates", len(storedFiles))
-	}
 }
 
 // clearCorrectedText clears the corrected text area
@@ -931,8 +909,13 @@ func (a *AppState) processQueueItem(audioData []byte, mode string) {
 	log.Printf("processQueueItem: starting new transcription, shouldCancel reset to false")
 	a.processingMutex.Unlock()
 
-	// Create WAV file
-	wavData := CreateWAVFile(audioData, 16000, 1)
+	// Convert to MP3 128kbps for transcription (smaller file size, faster upload)
+	mp3Data, err := a.audioStorage.ConvertToMP3(audioData, 16000, 128)
+	if err != nil {
+		log.Printf("Failed to convert to MP3, falling back to WAV: %v", err)
+		// Fallback to WAV if MP3 conversion fails
+		mp3Data = CreateWAVFile(audioData, 16000, 1)
+	}
 
 	// Check for cancel before transcribing
 	a.processingMutex.Lock()
@@ -950,8 +933,8 @@ func (a *AppState) processQueueItem(audioData []byte, mode string) {
 	if language == "" {
 		language = "ru" // Default to Russian if not set
 	}
-	log.Printf("Processing transcription with language: %s", language)
-	transcription, err := a.transcribeWithRetry(wavData, "recording.wav", language)
+	log.Printf("Processing transcription with language: %s (using MP3 128kbps)", language)
+	transcription, err := a.transcribeWithRetry(mp3Data, "recording.mp3", language)
 	if err != nil {
 		setStatusText(a.statusLabel, "Transcribed Failed")
 		a.resetActiveButton()

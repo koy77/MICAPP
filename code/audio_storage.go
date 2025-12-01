@@ -120,24 +120,39 @@ func (as *AudioStorage) StoreAudio(pcmData []byte, sampleRate uint32) ([]AudioFi
 	return storedFiles, nil
 }
 
-// SaveLastRecording saves the recording as a WAV file to the recordings folder
+// SaveLastRecording saves the recording as MP3 128kbps to the recordings folder
 func (as *AudioStorage) SaveLastRecording(pcmData []byte, sampleRate uint32) (string, error) {
 	timestamp := time.Now()
+	baseFilename := fmt.Sprintf("recording_%s", timestamp.Format("20060102_150405"))
 
-	// Create filename with timestamp
-	filename := fmt.Sprintf("recording_%s.wav", timestamp.Format("20060102_150405"))
-	filepath := filepath.Join(as.baseDir, filename)
+	// Save only MP3 128kbps (used for transcription)
+	mp3Filename := baseFilename + ".mp3"
+	mp3Filepath := filepath.Join(as.baseDir, mp3Filename)
 
-	// Convert PCM to WAV using the existing WAV helper
-	wavData := CreateWAVFile(pcmData, sampleRate, 1)
-
-	// Write WAV file
-	err := os.WriteFile(filepath, wavData, 0644)
+	mp3Data, err := as.convertPCMToMP3(pcmData, sampleRate, 128)
 	if err != nil {
-		return "", fmt.Errorf("failed to write WAV file: %v", err)
+		return "", fmt.Errorf("failed to convert to MP3: %v", err)
 	}
 
-	return filename, nil
+	err = os.WriteFile(mp3Filepath, mp3Data, 0644)
+	if err != nil {
+		return "", fmt.Errorf("failed to write MP3 file: %v", err)
+	}
+
+	// Verify MP3 file was written correctly
+	mp3Info, err := os.Stat(mp3Filepath)
+	if err != nil {
+		log.Printf("Failed to stat MP3 file: %v", err)
+	} else {
+		log.Printf("MP3 file saved: %s (size: %d bytes, bitrate: 128 kbps)", mp3Filepath, mp3Info.Size())
+	}
+
+	return mp3Filename, nil
+}
+
+// ConvertToMP3 converts PCM data to MP3 format using ffmpeg (public method)
+func (as *AudioStorage) ConvertToMP3(pcmData []byte, sampleRate uint32, bitrate int) ([]byte, error) {
+	return as.convertPCMToMP3(pcmData, sampleRate, bitrate)
 }
 
 // convertPCMToMP3 converts PCM data to MP3 format using ffmpeg
