@@ -49,62 +49,51 @@ func copyImageToClipboard(imageData []byte) error {
 func captureScreenRegion(x, y, width, height int) ([]byte, error) {
 	log.Printf("captureScreenRegion called with x=%d, y=%d, width=%d, height=%d", x, y, width, height)
 
-	// Capture full screen
-	screenBitmap := robotgo.CaptureScreen()
-	if screenBitmap == nil {
-		return nil, fmt.Errorf("failed to capture full screen")
-	}
-	defer robotgo.FreeBitmap(screenBitmap)
-
-	fullImg := robotgo.ToImage(screenBitmap)
-	if fullImg == nil {
-		return nil, fmt.Errorf("failed to convert screen bitmap to image")
-	}
-
-	bounds := fullImg.Bounds()
-
-	// Clamp requested region to screen bounds
-	if x < bounds.Min.X {
-		x = bounds.Min.X
-	}
-	if y < bounds.Min.Y {
-		y = bounds.Min.Y
-	}
-	if width < 1 {
-		width = 1
-	}
-	if height < 1 {
-		height = 1
+	// Try to capture using maim first (highly reliable on Linux X11)
+	if _, err := exec.LookPath("maim"); err == nil {
+		log.Printf("Using maim for capture")
+		// maim -g WIDTHxHEIGHT+X+Y
+		geometry := fmt.Sprintf("%dx%d+%d+%d", width, height, x, y)
+		cmd := exec.Command("maim", "-g", geometry)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err == nil && out.Len() > 0 {
+			log.Printf("Maim capture successful, size: %d bytes", out.Len())
+			return out.Bytes(), nil
+		}
+		log.Printf("Maim capture failed: %v", err)
 	}
 
-	if x+width > bounds.Max.X {
-		width = bounds.Max.X - x
-	}
-	if y+height > bounds.Max.Y {
-		height = bounds.Max.Y - y
-	}
-
-	if width <= 0 || height <= 0 {
-		return nil, fmt.Errorf("invalid cropped region after clamping to screen bounds")
-	}
-
-	region := image.Rect(x, y, x+width, y+height)
-
-	subImager, ok := fullImg.(interface {
-		SubImage(r image.Rectangle) image.Image
-	})
-	if !ok {
-		return nil, fmt.Errorf("image does not support SubImage")
+	// Try ImageMagick import as second choice
+	if _, err := exec.LookPath("import"); err == nil {
+		log.Printf("Using ImageMagick import for capture")
+		// import -window root -crop WIDTHxHEIGHT+X+Y png:-
+		geometry := fmt.Sprintf("%dx%d+%d+%d", width, height, x, y)
+		cmd := exec.Command("import", "-window", "root", "-crop", geometry, "png:-")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err == nil && out.Len() > 0 {
+			log.Printf("Import capture successful, size: %d bytes", out.Len())
+			return out.Bytes(), nil
+		}
+		log.Printf("Import capture failed: %v", err)
 	}
 
-	cropped := subImager.SubImage(region)
-
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, cropped); err != nil {
-		return nil, fmt.Errorf("failed to encode cropped image as PNG: %w", err)
+	// Fallback to robotgo (might produce black images on some X11 setups)
+	log.Printf("Falling back to robotgo for capture")
+	screenBitmap := robotgo.CaptureScreen(x, y, width, height)
+	if screenBitmap != nil {
+		defer robotgo.FreeBitmap(screenBitmap)
+		img := robotgo.ToImage(screenBitmap)
+		if img != nil {
+			var buf bytes.Buffer
+			if err := png.Encode(&buf, img); err == nil {
+				return buf.Bytes(), nil
+			}
+		}
 	}
 
-	return buf.Bytes(), nil
+	return nil, fmt.Errorf("all capture methods failed")
 }
 
 // captureSelection captures the selected region as screenshot
