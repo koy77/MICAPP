@@ -15,6 +15,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -124,11 +125,11 @@ func (a *AppState) monitorGohookEvents() {
 	var lastX, lastY int
 	var startX, startY int
 	ctrlPressed := false
-	shiftPressed := false // Track Shift key state
+	altPressed := false // Track Alt key state
 
 	log.Printf("Gohook event monitor started, waiting for events...")
 	log.Printf("=== KEYBOARD EVENT LOGGING ENABLED - All key presses will be logged ===")
-	log.Printf("=== SCREENSHOT CAPTURE: Ctrl + Left Shift + Mouse Drag ===")
+	log.Printf("=== SCREENSHOT CAPTURE: Ctrl + Alt + Mouse Drag ===")
 
 	eventCount := 0
 	for ev := range events {
@@ -148,14 +149,11 @@ func (a *AppState) monitorGohookEvents() {
 			// Update last known mouse position
 			lastX = int(ev.X)
 			lastY = int(ev.Y)
-			// Log first few mouse moves to verify gohook is working
-			// (will be noisy, but helps debug)
 
-			// If Ctrl + Shift are both pressed, update selection coordinates
-			if ctrlPressed && shiftPressed {
+			// If Ctrl + Alt are both pressed, update selection coordinates
+			if ctrlPressed && altPressed {
 				a.mouseHookMutex.Lock()
-				// Update last position while Ctrl is pressed (this is the end point)
-				oldX, oldY := a.lastX, a.lastY
+				// Update last position while keys are pressed
 				a.lastX, a.lastY = lastX, lastY
 
 				if !a.isSelecting {
@@ -163,173 +161,91 @@ func (a *AppState) monitorGohookEvents() {
 					a.isSelecting = true
 					log.Printf("Mouse monitor: Selection started - start=(%d, %d), current=(%d, %d)",
 						a.startX, a.startY, lastX, lastY)
-				} else if oldX != lastX || oldY != lastY {
-					// Only log when position actually changes
-					log.Printf("Mouse monitor: Selection updated - start=(%d, %d), current=(%d, %d)",
-						a.startX, a.startY, lastX, lastY)
 				}
 				a.mouseHookMutex.Unlock()
 			}
 
 		case hook.KeyDown:
-			// Log all keyboard events for debugging - detailed logging to find Function key
+			// Log all keyboard events for debugging
 			log.Printf("=== KEYDOWN === Rawcode=%d, Keycode=%d, Keychar='%c' (rune=%d), Mask=%d, Button=%d, Clicks=%d, Kind=%d",
 				ev.Rawcode, ev.Keycode, ev.Keychar, ev.Keychar, ev.Mask, ev.Button, ev.Clicks, ev.Kind)
 
 			// Check for Ctrl key press
-			// Rawcode 65507 is Ctrl in gohook on Linux
-			// Keycode 29 is also Ctrl
-			// Also check for X11 codes 37 (left Ctrl) and 105 (right Ctrl) for compatibility
 			if ev.Rawcode == 65507 || ev.Rawcode == 37 || ev.Rawcode == 105 || ev.Keycode == 29 || ev.Keycode == 37 || ev.Keycode == 105 {
 				if !ctrlPressed {
 					ctrlPressed = true
-					log.Printf("Ctrl key PRESSED (gohook) - Rawcode=%d, Keycode=%d", ev.Rawcode, ev.Keycode)
-					// Only start selection if Shift is also pressed
-					if shiftPressed {
-						// Use last known mouse position as start point, or get current position if not set
-						if lastX == 0 && lastY == 0 {
-							// Get current mouse position using robotgo
-							startX, startY = robotgo.GetMousePos()
-							lastX, lastY = startX, startY // Update last position too
-						} else {
-							startX = lastX
-							startY = lastY
-						}
-						log.Printf("Ctrl+Shift: Starting selection at point: %d, %d", startX, startY)
-
+					log.Printf("Ctrl key PRESSED (gohook)")
+					if altPressed {
 						a.mouseHookMutex.Lock()
-						a.ctrlKeyPressed = true
+						startX, startY = robotgo.GetMousePos()
 						a.startX, a.startY = startX, startY
 						a.lastX, a.lastY = startX, startY
-						a.isSelecting = false // Will be set to true by MouseMove
-						log.Printf("Set start position to (%d, %d) when Ctrl+Shift pressed", startX, startY)
+						a.isSelecting = false
+						log.Printf("Ctrl+Alt: Starting selection at point: %d, %d", startX, startY)
 						a.mouseHookMutex.Unlock()
 					}
 				}
 			}
 
-			// Check for Left Shift key press
-			// Rawcode 50 is Left Shift in X11
-			// Keycode 42 is also Left Shift
-			if ev.Rawcode == 50 || ev.Keycode == 42 {
-				if !shiftPressed {
-					shiftPressed = true
-					log.Printf("Left Shift key PRESSED (gohook) - Rawcode=%d, Keycode=%d", ev.Rawcode, ev.Keycode)
-					// Only start selection if Ctrl is also pressed
+			// Check for Alt key press
+			if ev.Rawcode == 65513 || ev.Rawcode == 65514 || ev.Keycode == 56 || ev.Keycode == 64 {
+				if !altPressed {
+					altPressed = true
+					log.Printf("Alt key PRESSED (gohook)")
 					if ctrlPressed {
-						// Use last known mouse position as start point, or get current position if not set
-						if lastX == 0 && lastY == 0 {
-							// Get current mouse position using robotgo
-							startX, startY = robotgo.GetMousePos()
-							lastX, lastY = startX, startY // Update last position too
-						} else {
-							startX = lastX
-							startY = lastY
-						}
-						log.Printf("Ctrl+Shift: Starting selection at point: %d, %d", startX, startY)
-
 						a.mouseHookMutex.Lock()
-						a.ctrlKeyPressed = true
+						startX, startY = robotgo.GetMousePos()
 						a.startX, a.startY = startX, startY
 						a.lastX, a.lastY = startX, startY
-						a.isSelecting = false // Will be set to true by MouseMove
-						log.Printf("Set start position to (%d, %d) when Ctrl+Shift pressed", startX, startY)
+						a.isSelecting = false
+						log.Printf("Ctrl+Alt: Starting selection at point: %d, %d", startX, startY)
 						a.mouseHookMutex.Unlock()
 					}
 				}
 			}
 
 		case hook.KeyUp:
-			// Log all keyboard events for debugging - detailed logging to find Function key
-			log.Printf("=== KEYUP === Rawcode=%d, Keycode=%d, Keychar='%c' (rune=%d), Mask=%d, Button=%d, Clicks=%d, Kind=%d",
-				ev.Rawcode, ev.Keycode, ev.Keychar, ev.Keychar, ev.Mask, ev.Button, ev.Clicks, ev.Kind)
+			// Helper to handle trigger
+			triggerCapture := func(modifierName string) {
+				a.mouseHookMutex.Lock()
+				if a.isSelecting || a.startX != 0 || a.startY != 0 {
+					log.Printf("%s: Triggering capture (isSelecting=%v)", modifierName, a.isSelecting)
+
+					// Capture current state values
+					sX, sY := a.startX, a.startY
+					eX, eY := lastX, lastY
+
+					// Reset state immediately to prevent double triggers
+					a.isSelecting = false
+					a.startX, a.startY = 0, 0
+					a.lastX, a.lastY = 0, 0
+					a.mouseHookMutex.Unlock()
+
+					// Pass captured values to the goroutine
+					go a.captureSelectionWithCoords(sX, sY, eX, eY)
+				} else {
+					a.mouseHookMutex.Unlock()
+				}
+			}
 
 			// Check for Ctrl key release
-			// Rawcode 65507 is Ctrl in gohook on Linux
-			// Keycode 29 is also Ctrl
-			// Also check for X11 codes 37 (left Ctrl) and 105 (right Ctrl) for compatibility
 			if ev.Rawcode == 65507 || ev.Rawcode == 37 || ev.Rawcode == 105 || ev.Keycode == 29 || ev.Keycode == 37 || ev.Keycode == 105 {
 				if ctrlPressed {
 					ctrlPressed = false
-					log.Printf("Ctrl key RELEASED (gohook) - Rawcode=%d, Keycode=%d", ev.Rawcode, ev.Keycode)
-					// Only trigger capture if Shift was also pressed (Ctrl+Shift combination)
-					if shiftPressed {
-						// Use last known mouse position as end point, or get current position
-						endX := lastX
-						endY := lastY
-						if endX == 0 && endY == 0 {
-							// Get current mouse position using robotgo
-							endX, endY = robotgo.GetMousePos()
-							lastX, lastY = endX, endY // Update last position too
-						}
-						log.Printf("Ctrl+Shift: Ending selection at point: %d, %d", endX, endY)
-
-						a.mouseHookMutex.Lock()
-						a.ctrlKeyPressed = false
-						// Update end position
-						a.lastX, a.lastY = endX, endY
-						log.Printf("Set end position to (%d, %d) when Ctrl+Shift released", endX, endY)
-						if a.isSelecting {
-							log.Printf("Selection was active, triggering capture")
-							// Trigger screenshot capture
-							go a.captureSelection()
-							a.isSelecting = false
-						} else {
-							log.Printf("Selection was not active (isSelecting=false), but capturing anyway with start=(%d,%d) end=(%d,%d)",
-								a.startX, a.startY, a.lastX, a.lastY)
-							// Even if isSelecting is false, we should capture if we have valid coordinates
-							if a.startX != 0 || a.startY != 0 || a.lastX != 0 || a.lastY != 0 {
-								go a.captureSelection()
-							}
-						}
-						a.mouseHookMutex.Unlock()
-					} else {
-						// Ctrl released but Shift wasn't pressed, just reset state
-						a.mouseHookMutex.Lock()
-						a.ctrlKeyPressed = false
-						a.mouseHookMutex.Unlock()
+					log.Printf("Ctrl key RELEASED (gohook)")
+					if altPressed {
+						triggerCapture("Ctrl released")
 					}
 				}
 			}
 
-			// Check for Left Shift key release
-			// Rawcode 50 is Left Shift in X11
-			// Keycode 42 is also Left Shift
-			if ev.Rawcode == 50 || ev.Keycode == 42 {
-				if shiftPressed {
-					shiftPressed = false
-					log.Printf("Left Shift key RELEASED (gohook) - Rawcode=%d, Keycode=%d", ev.Rawcode, ev.Keycode)
-					// Only trigger capture if Ctrl was also pressed (Ctrl+Shift combination)
+			// Check for Alt key release
+			if ev.Rawcode == 65513 || ev.Rawcode == 65514 || ev.Keycode == 56 || ev.Keycode == 64 {
+				if altPressed {
+					altPressed = false
+					log.Printf("Alt key RELEASED (gohook)")
 					if ctrlPressed {
-						// Use last known mouse position as end point, or get current position
-						endX := lastX
-						endY := lastY
-						if endX == 0 && endY == 0 {
-							// Get current mouse position using robotgo
-							endX, endY = robotgo.GetMousePos()
-							lastX, lastY = endX, endY // Update last position too
-						}
-						log.Printf("Ctrl+Shift: Ending selection at point: %d, %d", endX, endY)
-
-						a.mouseHookMutex.Lock()
-						a.ctrlKeyPressed = false
-						// Update end position
-						a.lastX, a.lastY = endX, endY
-						log.Printf("Set end position to (%d, %d) when Ctrl+Shift released", endX, endY)
-						if a.isSelecting {
-							log.Printf("Selection was active, triggering capture")
-							// Trigger screenshot capture
-							go a.captureSelection()
-							a.isSelecting = false
-						} else {
-							log.Printf("Selection was not active (isSelecting=false), but capturing anyway with start=(%d,%d) end=(%d,%d)",
-								a.startX, a.startY, a.lastX, a.lastY)
-							// Even if isSelecting is false, we should capture if we have valid coordinates
-							if a.startX != 0 || a.startY != 0 || a.lastX != 0 || a.lastY != 0 {
-								go a.captureSelection()
-							}
-						}
-						a.mouseHookMutex.Unlock()
+						triggerCapture("Alt released")
 					}
 				}
 			}
@@ -1040,15 +956,18 @@ func (a *AppState) updateStoredAudioList() {
 }
 
 func main() {
-	// Configure logging to write to app.log file (truncate on each start)
+	// Configure logging to write to both app.log and stdout
 	logFile, err := os.OpenFile("app.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil {
 		log.Printf("Failed to open log file: %v, logging to stderr", err)
 	} else {
 		defer logFile.Close()
-		log.SetOutput(logFile)
+		// Use MultiWriter to log to both file and stdout
+		multi := io.MultiWriter(logFile, os.Stdout)
+		log.SetOutput(multi)
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
+	log.Printf("=== MICAPP STARTED ===")
 
 	// Check if OpenAI API key is set
 	if os.Getenv("OPENAI_API_KEY") == "" {

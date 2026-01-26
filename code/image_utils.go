@@ -54,14 +54,19 @@ func captureScreenRegion(x, y, width, height int) ([]byte, error) {
 		log.Printf("Using maim for capture")
 		// maim -g WIDTHxHEIGHT+X+Y
 		geometry := fmt.Sprintf("%dx%d+%d+%d", width, height, x, y)
+		log.Printf("Running command: maim -g %s", geometry)
 		cmd := exec.Command("maim", "-g", geometry)
 		var out bytes.Buffer
+		var stderr bytes.Buffer
 		cmd.Stdout = &out
+		cmd.Stderr = &stderr
 		if err := cmd.Run(); err == nil && out.Len() > 0 {
 			log.Printf("Maim capture successful, size: %d bytes", out.Len())
 			return out.Bytes(), nil
 		}
-		log.Printf("Maim capture failed: %v", err)
+		log.Printf("Maim capture failed: %v, stderr: %s", err, stderr.String())
+	} else {
+		log.Printf("maim not found in PATH")
 	}
 
 	// Try ImageMagick import as second choice
@@ -69,14 +74,19 @@ func captureScreenRegion(x, y, width, height int) ([]byte, error) {
 		log.Printf("Using ImageMagick import for capture")
 		// import -window root -crop WIDTHxHEIGHT+X+Y png:-
 		geometry := fmt.Sprintf("%dx%d+%d+%d", width, height, x, y)
+		log.Printf("Running command: import -window root -crop %s png:-", geometry)
 		cmd := exec.Command("import", "-window", "root", "-crop", geometry, "png:-")
 		var out bytes.Buffer
+		var stderr bytes.Buffer
 		cmd.Stdout = &out
+		cmd.Stderr = &stderr
 		if err := cmd.Run(); err == nil && out.Len() > 0 {
 			log.Printf("Import capture successful, size: %d bytes", out.Len())
 			return out.Bytes(), nil
 		}
-		log.Printf("Import capture failed: %v", err)
+		log.Printf("Import capture failed: %v, stderr: %s", err, stderr.String())
+	} else {
+		log.Printf("import not found in PATH")
 	}
 
 	// Fallback to robotgo (might produce black images on some X11 setups)
@@ -96,24 +106,32 @@ func captureScreenRegion(x, y, width, height int) ([]byte, error) {
 	return nil, fmt.Errorf("all capture methods failed")
 }
 
-// captureSelection captures the selected region as screenshot
-func (a *AppState) captureSelection() {
-	log.Printf("captureSelection called")
-	a.mouseHookMutex.Lock()
-	startX := a.startX
-	startY := a.startY
-	endX := a.lastX
-	endY := a.lastY
-	a.mouseHookMutex.Unlock()
+var (
+	lastCaptureTime sync.Map // Map of app state pointer to last capture time
+)
 
-	log.Printf("Selection coordinates: start=(%d, %d), end=(%d, %d)", startX, startY, endX, endY)
+// captureSelectionWithCoords captures the selected region as screenshot using provided coordinates
+func (a *AppState) captureSelectionWithCoords(startX, startY, endX, endY int) {
+	// Add a small cooldown to prevent double triggering
+	now := time.Now()
+	if val, ok := lastCaptureTime.Load(a); ok {
+		if lastTime, ok := val.(time.Time); ok {
+			if now.Sub(lastTime) < 500*time.Millisecond {
+				log.Printf("captureSelection: skipping duplicate call within cooldown period")
+				return
+			}
+		}
+	}
+	lastCaptureTime.Store(a, now)
+
+	log.Printf("captureSelection called with coords: start=(%d, %d), end=(%d, %d)", startX, startY, endX, endY)
 
 	if startX == 0 && startY == 0 && endX == 0 && endY == 0 {
 		log.Printf("Warning: Selection coordinates are all zero, skipping capture")
 		return
 	}
 
-	// If end coordinates are zero, use current mouse position
+	// If end coordinates are zero, use current mouse position (though they shouldn't be now)
 	if endX == 0 && endY == 0 {
 		endX, endY = robotgo.GetMousePos()
 		log.Printf("End coordinates were zero, using current mouse position: (%d, %d)", endX, endY)
@@ -149,7 +167,7 @@ func (a *AppState) captureSelection() {
 
 	log.Printf("Normalized selection region: x=%d, y=%d, width=%d, height=%d", minX, minY, width, height)
 
-	// Capture screenshot using full-screen capture + crop
+	// Capture screenshot
 	imageData, err := captureScreenRegion(minX, minY, width, height)
 	if err != nil {
 		log.Printf("Failed to capture screenshot: %v", err)
@@ -161,9 +179,18 @@ func (a *AppState) captureSelection() {
 		log.Printf("Closing all existing image editor windows")
 		closeAllImageEditorWindows(a)
 		// Automatically open image editor with captured image
-		log.Printf("Opening image editor automatically after CTRL+SHIFT capture")
+		log.Printf("Opening image editor automatically after capture")
 		openImageEditorWithAppState(imageData, a)
 	}
+}
+
+// captureSelection is a legacy wrapper that uses AppState coordinates
+func (a *AppState) captureSelection() {
+	a.mouseHookMutex.Lock()
+	sX, sY := a.startX, a.startY
+	eX, eY := a.lastX, a.lastY
+	a.mouseHookMutex.Unlock()
+	a.captureSelectionWithCoords(sX, sY, eX, eY)
 }
 
 // updateCapturedImage updates the UI with the captured image
@@ -640,13 +667,15 @@ func openImageEditor(imageData []byte) {
 
 // openImageEditorWithAppState opens a new window with image editor and saves to AppState
 func openImageEditorWithAppState(imageData []byte, appState *AppState) {
+	log.Printf("openImageEditorWithAppState called, image size: %d bytes", len(imageData))
 	// Use existing app instead of creating new one
 	currentApp := fyne.CurrentApp()
 	if currentApp == nil {
-		log.Printf("No current Fyne app available")
+		log.Printf("ERROR: No current Fyne app available, cannot open editor")
 		return
 	}
 
+	log.Printf("Creating new editor window")
 	editorWindow := currentApp.NewWindow("Editor")
 
 	// Store reference to editor window in AppState if provided
