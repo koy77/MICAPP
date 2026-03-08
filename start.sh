@@ -200,17 +200,8 @@ run_app() {
     # Make executable
     chmod +x micapp
     
-    # Run the recording dot in background
-    cd "$(dirname "$0")"
-    python3 recording-dot.py > dot_log.txt 2>&1 &
-    DOT_PID=$!
-    cd - > /dev/null
-
     # Run the application
     ./micapp
-
-    # Kill dot when app exits
-    kill $DOT_PID 2>/dev/null || true
 }
 
 # Function to show help

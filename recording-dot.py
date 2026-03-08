@@ -62,7 +62,7 @@ def create_overlay(dot_color="red", diameter_px=150, opacity=1.0):
     
     win_size = diameter_px + 10
     x = (screen_width - win_size) // 2
-    y = screen_height - win_size - 10 # Lowered from 100 to 10px from bottom
+    y = screen_height - win_size - 10 # 10px from bottom
     
     window.move(x, y)
     window.resize(win_size, win_size)

@@ -510,7 +510,7 @@ func (a *AppState) StartRecording() error {
 	}
 	// Start Python red dot utility
 	go func() {
-		cmd := exec.Command("python3", "/home/ttt/apps/SECOND_BRAIN/MICAPP/recording-dot.py", "--size", "150")
+		cmd := exec.Command("python3", "./recording-dot.py", "--size", "150")
 		if err := cmd.Start(); err == nil {
 			a.dotProcess = cmd.Process
 		} else {
