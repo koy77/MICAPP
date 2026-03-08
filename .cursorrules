@@ -1,0 +1,9 @@
+# MICAPP Development Rules
+
+- ALWAYS run `./start.sh --build` or `./start.sh` after making any code changes to ensure the application builds correctly and changes are applied.
+- Prefer using absolute paths when calling tools.
+- Follow the existing project structure:
+  - `code/`: Go source files.
+  - `recordings/`: Audio recording storage.
+- Ensure `OPENAI_API_KEY` is set in the environment before running.
+

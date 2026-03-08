@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VoiceTranscriber Start Script
-# This script builds and runs the VoiceTranscriber application from the host machine
+# MICAPP Start Script
+# This script builds and runs the MICAPP application from the host machine
 
 set -e  # Exit on any error
 
@@ -106,26 +106,26 @@ install_dependencies() {
 
 # Function to build the application
 build_app() {
-    print_status "Building VoiceTranscriber..."
+    print_status "Building MICAPP..."
     
     # Clean previous build
-    if [ -f "voicetranscriber" ]; then
-        rm voicetranscriber
+    if [ -f "micapp" ]; then
+        rm micapp
         print_status "Removed previous build"
     fi
     
     # Build the application
     print_status "Compiling application..."
-    CGO_ENABLED=1 go build -ldflags='-s -w' -o voicetranscriber ./code
+    CGO_ENABLED=1 go build -ldflags='-s -w' -o micapp ./code
     
     if [ $? -eq 0 ]; then
         # Make executable
-        chmod +x voicetranscriber
+        chmod +x micapp
         
         print_success "Application built successfully"
         
         # Show build info
-        BUILD_SIZE=$(du -h voicetranscriber | cut -f1)
+        BUILD_SIZE=$(du -h micapp | cut -f1)
         print_status "Build size: $BUILD_SIZE"
     else
         print_error "Build failed"
@@ -133,37 +133,100 @@ build_app() {
     fi
 }
 
+# Function to install the application to the system
+install_app() {
+    print_status "Installing MICAPP to the system..."
+    
+    # Save OPENAI_API_KEY to .env if it exists in current session
+    if [ ! -z "$OPENAI_API_KEY" ]; then
+        echo "OPENAI_API_KEY=$OPENAI_API_KEY" > .env
+        print_success "Saved OPENAI_API_KEY to .env"
+    fi
+
+    # Create desktop entry
+    DESKTOP_FILE="$HOME/.local/share/applications/micapp.desktop"
+    mkdir -p "$(dirname "$DESKTOP_FILE")"
+    
+    cat > "$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Name=MICAPP
+Comment=Voice Transcription Tool
+Exec=$(pwd)/micapp
+Icon=$(pwd)/red_cube_icon.png
+Path=$(pwd)
+Terminal=false
+Type=Application
+Categories=Utility;
+StartupNotify=true
+EOF
+    
+    chmod +x "$DESKTOP_FILE"
+    
+    # Convert SVG icon to PNG if needed
+    if [ -f "red_cube_icon.svg" ] && [ ! -f "red_cube_icon.png" ]; then
+        if command_exists convert; then
+            convert red_cube_icon.svg red_cube_icon.png
+        fi
+    fi
+    
+    print_success "MICAPP installed to $DESKTOP_FILE"
+    print_status "It should now appear in your Ubuntu Applications list."
+}
+
 # Function to run the application
 run_app() {
-    print_status "Starting VoiceTranscriber..."
+    print_status "Starting MICAPP and recording dot..."
     print_status "Make sure your microphone is connected and permissions are granted"
     echo ""
     
+    # Kill any existing instances
+    if pgrep -x "micapp" > /dev/null; then
+        print_warning "Found existing MICAPP processes. Killing them..."
+        pkill -x "micapp" || true
+        sleep 1
+    fi
+
+    if pgrep -f "recording-dot.py" > /dev/null; then
+        print_warning "Found existing recording-dot processes. Killing them..."
+        pkill -f "recording-dot.py" || true
+    fi
+
     # Check if executable exists
-    if [ ! -f "voicetranscriber" ]; then
+    if [ ! -f "micapp" ]; then
         print_error "Executable not found. Please build the application first."
         exit 1
     fi
     
     # Make executable
-    chmod +x voicetranscriber
+    chmod +x micapp
     
+    # Run the recording dot in background
+    cd "$(dirname "$0")"
+    python3 recording-dot.py > dot_log.txt 2>&1 &
+    DOT_PID=$!
+    cd - > /dev/null
+
     # Run the application
-    ./voicetranscriber
+    ./micapp
+
+    # Kill dot when app exits
+    kill $DOT_PID 2>/dev/null || true
 }
 
 # Function to show help
 show_help() {
-    echo "VoiceTranscriber Start Script"
+    echo "MICAPP Start Script"
     echo ""
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
     echo "  -h, --help     Show this help message"
-    echo "  -b, --build    Only build the application (don't run)"
-    echo "  -r, --run      Only run the application (don't build)"
+    echo "  -b, --build    Only build the application (don't run/install)"
+    echo "  -r, --run      Only run the application (don't build/install)"
+    echo "  -i, --install  Build and install desktop entry (show in Applications)"
+    echo "  -d, --deploy   Clean, build, and reinstall fully (for system menu)"
     echo "  -c, --clean    Clean build artifacts"
-    echo "  -d, --deps     Only install dependencies"
+    echo "  --deps         Only install dependencies"
     echo ""
     echo "Environment Variables:"
     echo "  OPENAI_API_KEY    Your OpenAI API key (required)"
@@ -175,7 +238,9 @@ show_help() {
     echo "  - X11 development libraries (for Linux)"
     echo ""
     echo "Examples:"
-    echo "  $0                # Build and run"
+    echo "  $0                # Build, install desktop entry, and run"
+    echo "  $0 --install      # Build and install desktop entry"
+    echo "  $0 --deploy       # Full clean reinstall for system menu"
     echo "  $0 --build        # Only build"
     echo "  $0 --run          # Only run (requires existing build)"
     echo "  $0 --clean        # Clean build artifacts"
@@ -185,14 +250,26 @@ show_help() {
 clean_build() {
     print_status "Cleaning build artifacts..."
     
-    if [ -f "voicetranscriber" ]; then
-        rm voicetranscriber
+    if [ -f "micapp" ]; then
+        rm micapp
         print_success "Removed executable"
     fi
     
-    if [ -d ".voicetranscriber" ]; then
-        rm -rf .voicetranscriber
+    if [ -f "red_cube_icon.png" ]; then
+        rm red_cube_icon.png
+        print_success "Removed generated icon"
+    fi
+    
+    if [ -d ".micapp" ]; then
+        rm -rf .micapp
         print_success "Removed application data directory"
+    fi
+    
+    # Remove desktop entry
+    DESKTOP_FILE="$HOME/.local/share/applications/micapp.desktop"
+    if [ -f "$DESKTOP_FILE" ]; then
+        rm "$DESKTOP_FILE"
+        print_success "Removed desktop entry"
     fi
     
     print_success "Clean completed"
@@ -201,7 +278,7 @@ clean_build() {
 # Main script logic
 main() {
     echo "=========================================="
-    echo "    VoiceTranscriber Start Script"
+    echo "    MICAPP Start Script"
     echo "=========================================="
     echo ""
     
@@ -210,6 +287,8 @@ main() {
     RUN_ONLY=false
     CLEAN_ONLY=false
     DEPS_ONLY=false
+    INSTALL_ONLY=false
+    DEPLOY_ONLY=false
     
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -229,8 +308,16 @@ main() {
                 CLEAN_ONLY=true
                 shift
                 ;;
-            -d|--deps)
+            -d|--deploy)
+                DEPLOY_ONLY=true
+                shift
+                ;;
+            --deps)
                 DEPS_ONLY=true
+                shift
+                ;;
+            -i|--install)
+                INSTALL_ONLY=true
                 shift
                 ;;
             *)
@@ -253,6 +340,25 @@ main() {
         exit 0
     fi
     
+    if [ "$DEPLOY_ONLY" = true ]; then
+        print_status "Starting FULL DEPLOYMENT (clean + build + install)..."
+        clean_build
+        check_prerequisites
+        install_dependencies
+        build_app
+        install_app
+        print_success "FULL DEPLOYMENT completed! MICAPP is now available in your system menu."
+        exit 0
+    fi
+    
+    if [ "$INSTALL_ONLY" = true ]; then
+        check_prerequisites
+        install_dependencies
+        build_app
+        install_app
+        exit 0
+    fi
+
     if [ "$RUN_ONLY" = true ]; then
         run_app
         exit 0
@@ -265,10 +371,11 @@ main() {
         exit 0
     fi
     
-    # Default: build and run
+    # Default: build, install (desktop entry), and run
     check_prerequisites
     install_dependencies
     build_app
+    install_app
     run_app
 }
 

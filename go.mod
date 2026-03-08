@@ -6,6 +6,7 @@ require (
 	fyne.io/fyne/v2 v2.4.3
 	github.com/go-vgo/robotgo v0.110.8
 	github.com/gordonklaus/portaudio v0.0.0-20230709114228-aafa478834f5
+	github.com/gorilla/websocket v1.5.3
 	github.com/robotn/gohook v0.42.2
 )
 

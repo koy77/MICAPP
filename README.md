@@ -6,9 +6,44 @@ Voice transcription application with GUI built with Go and Fyne framework.
 
 - Voice recording and transcription using OpenAI Whisper API
 - GUI interface built with Fyne
-- Audio storage with multiple bitrate options
+- Audio storage with rotation (keeps last 10 recordings)
+- WebSocket API for real-time text updates (`ws://localhost:8989/ws`)
+- Global hotkey **Alt + Q** to start/stop recording
+- Always-on-top window behavior
 - Text correction using LLM
 - Screenshot capture functionality
+
+## WebSocket API
+
+MICAPP includes a WebSocket server for real-time text updates.
+
+- **URL**: `ws://localhost:8989/ws`
+- **Protocol**: Simple JSON events
+
+### Event: `text_update`
+Sent whenever the transcription is updated.
+
+```json
+{
+  "type": "text_update",
+  "data": {
+    "text": "The full current text content...",
+    "mode": "start" // or "add"
+  }
+}
+```
+
+## Global Hotkeys
+
+- **Alt + Q**: Start/Stop recording from any application.
+- **Ctrl + Alt + Mouse Drag**: Capture a screenshot of a selected area.
+- **Escape**: Cancel current recording or processing.
+
+## Window Behavior
+
+- **Always on Top**: The application window stays above other windows.
+- **Fixed Size**: The window size is fixed (300x700) and will not expand.
+- **Auto-Positioning**: Automatically moves to the top-left (0, 200) on startup.
 
 ## Quick Start
 

@@ -147,7 +147,63 @@ func (as *AudioStorage) SaveLastRecording(pcmData []byte, sampleRate uint32) (st
 		log.Printf("MP3 file saved: %s (size: %d bytes, bitrate: 128 kbps)", mp3Filepath, mp3Info.Size())
 	}
 
+	// Rotate recordings to keep only the last 10
+	as.RotateRecordings(10)
+
 	return mp3Filename, nil
+}
+
+// RotateRecordings keeps only the N most recent recordings and deletes the rest
+func (as *AudioStorage) RotateRecordings(keepCount int) {
+	files, err := os.ReadDir(as.baseDir)
+	if err != nil {
+		log.Printf("Failed to read recordings directory for rotation: %v", err)
+		return
+	}
+
+	type fileInfo struct {
+		name    string
+		modTime time.Time
+	}
+
+	var recordings []fileInfo
+	for _, f := range files {
+		if !f.IsDir() && filepath.Ext(f.Name()) == ".mp3" {
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			recordings = append(recordings, fileInfo{
+				name:    f.Name(),
+				modTime: info.ModTime(),
+			})
+		}
+	}
+
+	// If we have fewer than keepCount recordings, nothing to do
+	if len(recordings) <= keepCount {
+		return
+	}
+
+	// Sort recordings by modification time (oldest first)
+	for i := 0; i < len(recordings); i++ {
+		for j := i + 1; j < len(recordings); j++ {
+			if recordings[i].modTime.After(recordings[j].modTime) {
+				recordings[i], recordings[j] = recordings[j], recordings[i]
+			}
+		}
+	}
+
+	// Delete oldest recordings
+	deleteCount := len(recordings) - keepCount
+	for i := 0; i < deleteCount; i++ {
+		err := os.Remove(filepath.Join(as.baseDir, recordings[i].name))
+		if err != nil {
+			log.Printf("Failed to delete old recording %s: %v", recordings[i].name, err)
+		} else {
+			log.Printf("Deleted old recording: %s", recordings[i].name)
+		}
+	}
 }
 
 // ConvertToMP3 converts PCM data to MP3 format using ffmpeg (public method)

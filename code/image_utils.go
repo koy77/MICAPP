@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"image"
 	"image/color"
@@ -107,24 +108,28 @@ func captureScreenRegion(x, y, width, height int) ([]byte, error) {
 }
 
 var (
-	lastCaptureTime sync.Map // Map of app state pointer to last capture time
+	lastCaptureTime sync.Map   // Map of app state pointer to last capture time
+	captureMutex    sync.Mutex // Global mutex to prevent concurrent captures opening multiple windows
 )
 
 // captureSelectionWithCoords captures the selected region as screenshot using provided coordinates
 func (a *AppState) captureSelectionWithCoords(startX, startY, endX, endY int) {
-	// Add a small cooldown to prevent double triggering
+	// Add a small cooldown and use a mutex to prevent double triggering
+	captureMutex.Lock()
+	defer captureMutex.Unlock()
+
 	now := time.Now()
 	if val, ok := lastCaptureTime.Load(a); ok {
 		if lastTime, ok := val.(time.Time); ok {
-			if now.Sub(lastTime) < 500*time.Millisecond {
-				log.Printf("captureSelection: skipping duplicate call within cooldown period")
+			if now.Sub(lastTime) < 1000*time.Millisecond {
+				log.Printf("captureSelection: skipping duplicate call within cooldown period (1s)")
 				return
 			}
 		}
 	}
 	lastCaptureTime.Store(a, now)
 
-	log.Printf("captureSelection called with coords: start=(%d, %d), end=(%d, %d)", startX, startY, endX, endY)
+	log.Printf("captureSelectionWithCoords (under lock) called with: start=(%d, %d), end=(%d, %d)", startX, startY, endX, endY)
 
 	if startX == 0 && startY == 0 && endX == 0 && endY == 0 {
 		log.Printf("Warning: Selection coordinates are all zero, skipping capture")
@@ -257,7 +262,7 @@ func (a *AppState) updateCapturedImage(imageData []byte) {
 
 	log.Printf("Image container updated successfully")
 
-	// Automatically copy image to clipboard when it's added to UI
+	// Automatically copy image to clipboard and paste when it's added to UI
 	log.Printf("Copying captured image to clipboard automatically")
 	if err := copyImageToClipboard(imageData); err != nil {
 		log.Printf("Failed to copy image to clipboard: %v", err)
@@ -265,6 +270,22 @@ func (a *AppState) updateCapturedImage(imageData []byte) {
 	} else {
 		log.Printf("Image copied to clipboard successfully")
 		setStatusText(a.statusLabel, "Image captured")
+
+		// Broadcast image via WebSocket (base64)
+		base64Image := base64.StdEncoding.EncodeToString(imageData)
+		a.wsServer.Broadcast("image_update", map[string]string{
+			"image":  base64Image,
+			"format": "png",
+		})
+
+		// Small delay and then simulate Ctrl+V to paste image
+		time.Sleep(200 * time.Millisecond)
+		log.Printf("Simulating Ctrl+V to paste image...")
+		robotgo.KeyDown("control")
+		time.Sleep(50 * time.Millisecond)
+		robotgo.KeyTap("v")
+		time.Sleep(50 * time.Millisecond)
+		robotgo.KeyUp("control")
 	}
 }
 
@@ -716,24 +737,85 @@ func openImageEditorWithAppState(imageData []byte, appState *AppState) {
 	editorWindow.CenterOnScreen()
 
 	// Create container that centers the canvas (no scroll, image stays original size)
-	// Use Max container to fill window, canvas will center itself in Layout
 	canvasContainer := container.NewMax(canvasWidget)
 
-	editorWindow.SetContent(canvasContainer)
+	// Create recording indicator (red circle)
+	indicatorCircle := canvas.NewCircle(color.RGBA{R: 255, G: 0, B: 0, A: 255})
+	indicatorCircle.StrokeWidth = 0
+
+	// Wrap indicator in a container that will be positioned manually
+	recordingIndicator := container.NewGridWrap(fyne.NewSize(30, 30), indicatorCircle)
+	recordingIndicator.Hide()
+
+	// Store reference in AppState so main recording logic can toggle it
+	if appState != nil {
+		appState.recordingIndicator = recordingIndicator
+	}
+
+	// Use a container with no layout for the indicator to position it at the very top
+	indicatorOverlay := container.NewWithoutLayout(recordingIndicator)
+
+	// Wrap everything in a Stack to overlay the indicator on top of the image
+	mainStack := container.NewStack(canvasContainer, indicatorOverlay)
+	editorWindow.SetContent(mainStack)
+
+	// Use a goroutine to position the indicator after the window is shown and layout is calculated
+	go func() {
+		for i := 0; i < 20; i++ {
+			time.Sleep(100 * time.Millisecond)
+			size := editorWindow.Canvas().Size()
+			if size.Width > 0 {
+				posX := (size.Width - 30) / 2
+				recordingIndicator.Move(fyne.NewPos(posX, 10))
+				recordingIndicator.Refresh()
+				editorWindow.Canvas().Refresh(mainStack) // Force refresh of the whole stack
+			}
+		}
+	}()
 
 	// Add Escape key handler to close window without saving
 	// Add W key handler to close window and save image
+	// Add Q key handler to toggle recording
 	editorWindow.Canvas().SetOnTypedKey(func(event *fyne.KeyEvent) {
+		log.Printf("Image Editor: Key pressed: %v", event.Name)
 		if event.Name == fyne.KeyEscape {
 			log.Printf("Escape pressed in image editor, closing window without saving")
+			// If recording, stop it
+			if appState != nil && appState.isRecording {
+				appState.StopRecording()
+			}
 			// Clear reference when closing
 			if appState != nil {
 				appState.imageEditorWindow = nil
+				appState.recordingIndicator = nil // Also clear indicator reference
 			}
 			// Close window without saving
 			editorWindow.Close()
+		} else if event.Name == fyne.KeyQ {
+			log.Printf("Q key detected in image editor, toggling recording")
+			if appState != nil {
+				if !appState.isRecording {
+					log.Printf("Starting recording from editor")
+					appState.recordingMode = "start" // Match "Start" button behavior
+					err := appState.StartRecording()
+					if err != nil {
+						log.Printf("Failed to start recording from editor: %v", err)
+					}
+					// Note: StartRecording handles showing the indicator
+				} else {
+					log.Printf("Stopping recording from editor")
+					appState.StopRecording()
+					// Note: StopRecording handles hiding the indicator
+				}
+			}
 		} else if event.Name == fyne.KeyW {
-			log.Printf("W pressed in image editor, closing window and saving image")
+			log.Printf("W key detected in image editor, closing window and saving image")
+
+			// If recording, stop it and process
+			if appState != nil && appState.isRecording {
+				log.Printf("Stopping active recording before closing editor")
+				appState.StopRecording()
+			}
 
 			// Get final image with all arrows
 			finalImageData := canvasWidget.drawImageWithArrows()
@@ -753,13 +835,21 @@ func openImageEditorWithAppState(imageData []byte, appState *AppState) {
 
 			// Close window
 			editorWindow.Close()
+		} else {
+			log.Printf("Other key pressed in editor: %v", event.Name)
 		}
 	})
 
 	// Clear reference when window is closed (for Escape key or window close button)
 	editorWindow.SetCloseIntercept(func() {
+		// If recording, stop it
+		if appState != nil && appState.isRecording {
+			log.Printf("Closing editor: stopping active recording")
+			appState.StopRecording()
+		}
 		if appState != nil {
 			appState.imageEditorWindow = nil
+			appState.recordingIndicator = nil // Also clear indicator reference
 		}
 		editorWindow.Close()
 	})

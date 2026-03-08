@@ -27,6 +27,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -37,25 +38,59 @@ import (
 
 // copyToClipboard copies text to clipboard using xclip
 func copyToClipboard(text string) error {
-	cmd := exec.Command("xclip", "-selection", "clipboard")
+	// Use both PRIMARY and CLIPBOARD selections to be safe
+	// Some apps use one, some use the other
+
+	// 1. Copy to CLIPBOARD (standard Ctrl+V)
+	cmd := exec.Command("xclip", "-selection", "clipboard", "-t", "UTF8_STRING")
 	stdin, err := cmd.StdinPipe()
+	if err == nil {
+		if err := cmd.Start(); err == nil {
+			stdin.Write([]byte(text))
+			stdin.Close()
+			cmd.Wait()
+		}
+	}
+
+	// 2. Copy to PRIMARY (middle click paste)
+	cmdPrimary := exec.Command("xclip", "-selection", "primary", "-t", "UTF8_STRING")
+	stdinP, err := cmdPrimary.StdinPipe()
+	if err == nil {
+		if err := cmdPrimary.Start(); err == nil {
+			stdinP.Write([]byte(text))
+			stdinP.Close()
+			cmdPrimary.Wait()
+		}
+	}
+
+	return nil
+}
+
+// copyToClipboard copies text to clipboard using xclip and optionally pastes it
+func (a *AppState) copyAndPaste(text string) {
+	if text == "" {
+		return
+	}
+
+	// 1. Copy to clipboard
+	err := copyToClipboard(text)
 	if err != nil {
-		return err
+		log.Printf("Failed to copy to clipboard: %v", err)
+		return
 	}
+	log.Printf("Text copied to clipboard")
 
-	if err := cmd.Start(); err != nil {
-		return err
-	}
+	// 2. Small delay to ensure clipboard is updated
+	time.Sleep(100 * time.Millisecond)
 
-	if _, err := stdin.Write([]byte(text)); err != nil {
-		return err
-	}
-
-	if err := stdin.Close(); err != nil {
-		return err
-	}
-
-	return cmd.Wait()
+	// 3. Simulate Ctrl+V
+	log.Printf("Simulating Ctrl+V to paste text...")
+	// Try a more robust key simulation
+	robotgo.KeyDown("control")
+	time.Sleep(100 * time.Millisecond)
+	robotgo.KeyTap("v")
+	time.Sleep(100 * time.Millisecond)
+	robotgo.KeyUp("control")
 }
 
 // clickableStatusLabel is a custom label that handles clicks to copy text
@@ -108,7 +143,7 @@ func (a *AppState) startMouseHook() {
 	a.isMouseHookActive = true
 	a.mouseHookMutex.Unlock()
 
-	log.Printf("Mouse hook started - monitoring for Ctrl+Shift+drag selection using gohook (isMouseHookActive=%v, ctrlKeyPressed=%v, isSelecting=%v)",
+	log.Printf("Mouse hook started - monitoring for Ctrl+Alt+drag selection using gohook (isMouseHookActive=%v, ctrlKeyPressed=%v, isSelecting=%v)",
 		a.isMouseHookActive, a.ctrlKeyPressed, a.isSelecting)
 
 	// Start gohook event monitor in separate goroutine
@@ -130,6 +165,7 @@ func (a *AppState) monitorGohookEvents() {
 	log.Printf("Gohook event monitor started, waiting for events...")
 	log.Printf("=== KEYBOARD EVENT LOGGING ENABLED - All key presses will be logged ===")
 	log.Printf("=== SCREENSHOT CAPTURE: Ctrl + Alt + Mouse Drag ===")
+	log.Printf("=== RECORDING TOGGLE: Alt + Q ===")
 
 	eventCount := 0
 	for ev := range events {
@@ -169,6 +205,22 @@ func (a *AppState) monitorGohookEvents() {
 			// Log all keyboard events for debugging
 			log.Printf("=== KEYDOWN === Rawcode=%d, Keycode=%d, Keychar='%c' (rune=%d), Mask=%d, Button=%d, Clicks=%d, Kind=%d",
 				ev.Rawcode, ev.Keycode, ev.Keychar, ev.Keychar, ev.Mask, ev.Button, ev.Clicks, ev.Kind)
+
+			// Check for Numpad Plus
+			if ev.Rawcode == 65451 || ev.Keycode == 78 || ev.Keychar == '+' {
+				log.Printf("Numpad Plus detected! Toggling recording...")
+				go a.onRecordButtonClick()
+				continue
+			}
+
+			// Check for Escape
+			if ev.Rawcode == 65307 || ev.Keycode == 1 || ev.Keychar == 27 {
+				log.Printf("Global Escape detected! Canceling recording...")
+				if a.isRecording {
+					go a.CancelRecording()
+				}
+				continue
+			}
 
 			// Check for Ctrl key press
 			if ev.Rawcode == 65507 || ev.Rawcode == 37 || ev.Rawcode == 105 || ev.Keycode == 29 || ev.Keycode == 37 || ev.Keycode == 105 {
@@ -323,11 +375,15 @@ type AppState struct {
 	recordingMode      string              // "start" or "add"
 	activeButton       *widget.Button      // Currently active recording button
 	transcriptionQueue []string            // Queue of pending transcriptions
+	wsServer           *WSServer           // WebSocket server
 	queueIndicators    []fyne.CanvasObject // Visual indicators for queue
 	queueContainer     *fyne.Container     // Container for queue indicators
 	imageContainer     *fyne.Container     // Container for image thumbnail
 	imageData          []byte              // Raw image data for clipboard
 	imageEditorWindow  fyne.Window         // Reference to image editor window (if open)
+	recordingIndicator fyne.CanvasObject   // Recording indicator for editor
+	mainIndicator      fyne.CanvasObject   // Recording indicator for main window
+	dotProcess         *os.Process         // Python process for the red dot
 	mouseHookMutex     sync.Mutex          // Mutex for mouse hook state
 	isMouseHookActive  bool                // Whether mouse hook is active
 	ctrlKeyPressed     bool                // Whether Ctrl key is currently pressed
@@ -362,6 +418,10 @@ func NewAppState() (*AppState, error) {
 	// Create audio storage
 	audioStorage := NewAudioStorage()
 
+	// WebSocket server
+	wsServer := NewWSServer()
+	StartWSServer(wsServer, "8989")
+
 	// Recreate recordings folder on app start
 	if err := audioStorage.RecreateRecordingsFolder(); err != nil {
 		log.Printf("Warning: Failed to recreate recordings folder: %v", err)
@@ -373,6 +433,7 @@ func NewAppState() (*AppState, error) {
 		openaiClient:       openaiClient,
 		llmClient:          llmClient,
 		audioStorage:       audioStorage,
+		wsServer:           wsServer,
 		stream:             nil,
 		correctedText:      nil,
 		recordButton:       nil,
@@ -435,6 +496,28 @@ func (a *AppState) StartRecording() error {
 	}
 
 	a.isRecording = true
+	// Show indicators
+	if a.recordingIndicator != nil {
+		a.recordingIndicator.Show()
+		a.recordingIndicator.Refresh()
+		if a.imageEditorWindow != nil {
+			a.imageEditorWindow.Canvas().Refresh(a.imageEditorWindow.Content())
+		}
+	}
+	if a.mainIndicator != nil {
+		a.mainIndicator.Show()
+		a.mainIndicator.Refresh()
+	}
+	// Start Python red dot utility
+	go func() {
+		cmd := exec.Command("python3", "/home/ttt/apps/SECOND_BRAIN/MICAPP/recording-dot.py", "--size", "150")
+		if err := cmd.Start(); err == nil {
+			a.dotProcess = cmd.Process
+		} else {
+			log.Printf("Failed to start recording-dot.py: %v", err)
+		}
+	}()
+
 	// Only update the active button text and color
 	if a.activeButton != nil {
 		a.activeButton.SetText("Send")
@@ -453,18 +536,39 @@ func (a *AppState) StopRecording() error {
 	}
 
 	// Stop the stream
-	err := a.stream.Stop()
-	if err != nil {
-		return fmt.Errorf("failed to stop audio stream: %v", err)
-	}
+	if a.stream != nil {
+		s := a.stream
+		a.stream = nil // Reset immediately
+		err := s.Stop()
+		if err != nil {
+			return fmt.Errorf("failed to stop audio stream: %v", err)
+		}
 
-	err = a.stream.Close()
-	if err != nil {
-		return fmt.Errorf("failed to close audio stream: %v", err)
+		err = s.Close()
+		if err != nil {
+			return fmt.Errorf("failed to close audio stream: %v", err)
+		}
 	}
-
-	a.stream = nil
 	a.isRecording = false
+
+	// Hide indicators
+	if a.recordingIndicator != nil {
+		a.recordingIndicator.Hide()
+		a.recordingIndicator.Refresh()
+		if a.imageEditorWindow != nil {
+			a.imageEditorWindow.Canvas().Refresh(a.imageEditorWindow.Content())
+		}
+	}
+	if a.mainIndicator != nil {
+		a.mainIndicator.Hide()
+		a.mainIndicator.Refresh()
+	}
+	// Kill Python red dot utility and any lingering instances
+	if a.dotProcess != nil {
+		a.dotProcess.Kill()
+		a.dotProcess = nil
+	}
+	exec.Command("pkill", "-f", "recording-dot.py").Run()
 
 	// Reset cancel flag before processing
 	a.processingMutex.Lock()
@@ -489,10 +593,13 @@ func (a *AppState) StopRecording() error {
 
 // resetActiveButton resets the active button to its original state
 func (a *AppState) resetActiveButton() {
+	a.processingMutex.Lock()
+	defer a.processingMutex.Unlock()
+
 	if a.activeButton != nil {
-		if a.activeButton == a.recordButton {
+		if a.recordButton != nil && a.activeButton == a.recordButton {
 			a.activeButton.SetText("Start")
-		} else {
+		} else if a.addButton != nil && a.activeButton == a.addButton {
 			a.activeButton.SetText("Add")
 		}
 		a.activeButton.Importance = widget.MediumImportance
@@ -514,24 +621,40 @@ func (a *AppState) CancelRecording() error {
 
 	// Stop and close audio stream
 	if a.stream != nil {
-		err := a.stream.Stop()
+		s := a.stream
+		a.stream = nil // Reset immediately to prevent double calls
+		log.Printf("CancelRecording: stopping stream %v", s)
+
+		err := s.Stop()
 		if err != nil {
 			log.Printf("CancelRecording: failed to stop audio stream: %v", err)
-			return fmt.Errorf("failed to stop audio stream: %v", err)
 		}
 
-		err = a.stream.Close()
+		err = s.Close()
 		if err != nil {
 			log.Printf("CancelRecording: failed to close audio stream: %v", err)
-			return fmt.Errorf("failed to close audio stream: %v", err)
 		}
-
-		a.stream = nil
 	}
 
 	// Reset recording state
 	a.isRecording = false
 	a.audioBuffer = make([]int16, 0)
+
+	// Hide indicators
+	if a.recordingIndicator != nil {
+		a.recordingIndicator.Hide()
+		a.recordingIndicator.Refresh()
+	}
+	if a.mainIndicator != nil {
+		a.mainIndicator.Hide()
+		a.mainIndicator.Refresh()
+	}
+	// Kill Python red dot utility and any lingering instances
+	if a.dotProcess != nil {
+		a.dotProcess.Kill()
+		a.dotProcess = nil
+	}
+	exec.Command("pkill", "-f", "recording-dot.py").Run()
 
 	// Remove reserved space for "add" mode
 	if a.recordingMode == "add" {
@@ -632,10 +755,10 @@ func (a *AppState) processAudio() {
 		return
 	}
 
-	// Check minimum recording duration (3 seconds at 16kHz sample rate)
-	minSamples := int(16000 * 3) // 3 seconds at 16kHz
+	// Check minimum recording duration (1 second at 16kHz sample rate)
+	minSamples := int(16000 * 1) // 1 second at 16kHz
 	if len(a.audioBuffer) < minSamples {
-		setStatusText(a.statusLabel, "Recording too short (minimum 3 seconds)")
+		setStatusText(a.statusLabel, "Recording too short (minimum 1 second)")
 
 		// If this was an "add" recording, remove the reserved space
 		if a.recordingMode == "add" {
@@ -904,22 +1027,31 @@ func (a *AppState) processQueueItem(audioData []byte, mode string) {
 		currentText += transcription
 		a.correctedText.SetText(currentText)
 
-		// Auto-copy to clipboard
-		if err := copyToClipboard(currentText); err != nil {
+		// Broadcast update via WebSocket
+		a.wsServer.Broadcast("text_update", map[string]string{
+			"text": currentText,
+			"mode": "add",
+		})
+
+		// Copy to clipboard only (don't paste to avoid duplication in textarea)
+		err := copyToClipboard(currentText)
+		if err != nil {
 			log.Printf("Failed to copy to clipboard: %v", err)
 		} else {
-			log.Printf("Text automatically copied to clipboard")
+			log.Printf("Text copied to clipboard")
 		}
 	} else {
 		// Start mode: replace text
 		a.correctedText.SetText(transcription)
 
-		// Auto-copy to clipboard
-		if err := copyToClipboard(transcription); err != nil {
-			log.Printf("Failed to copy to clipboard: %v", err)
-		} else {
-			log.Printf("Text automatically copied to clipboard")
-		}
+		// Broadcast update via WebSocket
+		a.wsServer.Broadcast("text_update", map[string]string{
+			"text": transcription,
+			"mode": "start",
+		})
+
+		// Auto-copy and paste to clipboard
+		a.copyAndPaste(transcription)
 	}
 
 	setStatusText(a.statusLabel, "Transcription completed")
@@ -955,6 +1087,32 @@ func (a *AppState) updateStoredAudioList() {
 	a.storedAudioList.Refresh()
 }
 
+// loadEnv loads environment variables from a .env file
+func loadEnv() {
+	content, err := os.ReadFile(".env")
+	if err != nil {
+		return // Ignore if file doesn't exist
+	}
+
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			// Only set if not already set in environment
+			if os.Getenv(key) == "" {
+				os.Setenv(key, value)
+			}
+		}
+	}
+}
+
 func main() {
 	// Configure logging to write to both app.log and stdout
 	logFile, err := os.OpenFile("app.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
@@ -969,29 +1127,53 @@ func main() {
 	}
 	log.Printf("=== MICAPP STARTED ===")
 
+	// Load .env file
+	loadEnv()
+
 	// Check if OpenAI API key is set
-	if os.Getenv("OPENAI_API_KEY") == "" {
-		log.Fatal("OPENAI_API_KEY environment variable is not set. Please set it before running the application.")
+	key := os.Getenv("OPENAI_API_KEY")
+	if key == "" {
+		log.Printf("ERROR: OPENAI_API_KEY environment variable is not set.")
+	} else {
+		maskedKey := ""
+		if len(key) > 8 {
+			maskedKey = key[:4] + "..." + key[len(key)-4:]
+		} else {
+			maskedKey = "****"
+		}
+		log.Printf("OPENAI_API_KEY is set: %s", maskedKey)
 	}
 
 	// Create application state
+	log.Printf("Initializing AppState...")
 	appState, err := NewAppState()
 	if err != nil {
 		log.Fatalf("Failed to initialize application: %v", err)
 	}
+	log.Printf("AppState initialized")
 	defer appState.Cleanup()
 
 	// Create Fyne application
+	log.Printf("Creating Fyne app...")
 	myApp := app.NewWithID("com.voicetranscriber.app")
+	log.Printf("Fyne app created")
 
 	// Set custom theme with white text
 	myApp.Settings().SetTheme(&CustomTheme{Theme: theme.DarkTheme()})
 
 	// Create main window
+	log.Printf("Creating main window...")
 	myWindow := myApp.NewWindow("MICAPP")
-	myWindow.Resize(fyne.NewSize(300, 700))  // Increased height to accommodate 500px editor + controls
-	myWindow.SetFixedSize(false)             // Allow resizing for better UX
-	myWindow.SetIcon(resourceRedcubeiconSvg) // Set red cube icon
+	log.Printf("Main window created")
+
+	// Set window to be always on top and fixed size
+	myWindow.Resize(fyne.NewSize(300, 700))
+	myWindow.SetFixedSize(true)
+	myWindow.SetIcon(resourceRedcubeiconSvg)
+	myWindow.SetMaster() // Ensure it's the master window
+	// Note: Fyne doesn't have a direct "AlwaysOnTop" method in all versions,
+	// but we can try to use X11 commands if needed.
+	// However, some versions of Fyne support it via internal hints or we can use xdotool.
 
 	// Create UI widgets
 	appState.correctedText = widget.NewMultiLineEntry()
@@ -1011,10 +1193,21 @@ func main() {
 	appState.addButton = widget.NewButton("Add", appState.onAddButtonClick)
 	appState.addButton.Resize(fyne.NewSize(100, 40))
 
+	// Create recording indicators
+	mainIndicatorCircle := canvas.NewCircle(color.RGBA{R: 255, G: 0, B: 0, A: 255})
+	mainIndicatorCircle.StrokeWidth = 0
+	// Use NewStack with a fixed size to ensure it's visible and large
+	appState.mainIndicator = container.NewGridWrap(fyne.NewSize(30, 30), mainIndicatorCircle)
+	appState.mainIndicator.Hide()
+
+	// Remove recording indicator for editor
+	appState.recordingIndicator = nil
+
 	// Create clickable status label
 	statusLabelWidget := newClickableStatusLabel(appState.correctedText)
 	statusLabelWidget.SetText("Ready")
 	statusLabelWidget.Alignment = fyne.TextAlignCenter
+	statusLabelWidget.Wrapping = fyne.TextWrapWord // Enable wrapping to prevent horizontal expansion
 	appState.statusLabel = statusLabelWidget
 
 	// Create stored audio list
@@ -1047,6 +1240,7 @@ func main() {
 	buttonContainer := container.NewHBox(
 		appState.recordButton,
 		appState.addButton,
+		appState.mainIndicator,
 		widget.NewSeparator(),
 		queueContainer,
 	)
@@ -1125,6 +1319,9 @@ func main() {
 	appState.startMouseHook()
 	defer appState.stopMouseHook()
 
+	// Ensure no lingering recording dots on startup
+	exec.Command("pkill", "-f", "recording-dot.py").Run()
+
 	// Set close intercept to close image editor window if open
 	myWindow.SetCloseIntercept(func() {
 		// Close image editor window if it's open
@@ -1134,31 +1331,48 @@ func main() {
 			appState.imageEditorWindow = nil
 		}
 		// Close main window
+		if appState.dotProcess != nil {
+			appState.dotProcess.Kill()
+		}
+		exec.Command("pkill", "-f", "recording-dot.py").Run()
 		myWindow.Close()
 	})
 
 	// Show window first
+	log.Printf("Calling myWindow.Show()...")
+	myWindow.CenterOnScreen()
 	myWindow.Show()
+	log.Printf("myWindow.Show() called")
 
 	// Move window to X=0, Y=200 position (Linux only, using xdotool)
 	// This is done after Show() to ensure window is created
 	go func() {
+		log.Printf("Starting window positioning goroutine")
 		// Small delay to ensure window is fully created
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(2 * time.Second)
 
 		// Try to move window using xdotool
 		// First, find the window by name and move it
-		cmd := exec.Command("sh", "-c", "xdotool search --name 'MICAPP' | head -1 | xargs -I {} xdotool windowmove {} 0 200")
-		if err := cmd.Run(); err != nil {
-			// If xdotool fails, try alternative method using wmctrl
-			log.Printf("xdotool failed, trying wmctrl: %v", err)
-			cmd2 := exec.Command("wmctrl", "-r", "MICAPP", "-e", "0,0,200,-1,-1")
-			if err2 := cmd2.Run(); err2 != nil {
-				log.Printf("Failed to set window position: %v (xdotool), %v (wmctrl). Window may appear at default position.", err, err2)
+		log.Printf("Attempting to move window using xdotool...")
+		// For now, let's just log if we find it, but don't move it yet to ensure visibility
+		cmd := exec.Command("sh", "-c", "xdotool search --name 'MICAPP'")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Printf("xdotool search failed: %v", err)
+		} else {
+			log.Printf("xdotool found window(s): %s", string(output))
+			// If we found it, let's try to move it gently and set always on top
+			moveCmd := exec.Command("sh", "-c", "xdotool search --name 'MICAPP' | head -1 | xargs -I {} sh -c 'xdotool windowmove {} 0 200 && wmctrl -i -r {} -b add,above'")
+			if moveErr := moveCmd.Run(); moveErr != nil {
+				log.Printf("xdotool move/above failed: %v", moveErr)
+			} else {
+				log.Printf("Window moved and set to always-on-top successfully")
 			}
 		}
 	}()
 
 	// Run application
+	log.Printf("Calling myApp.Run()...")
 	myApp.Run()
+	log.Printf("myApp.Run() finished")
 }
