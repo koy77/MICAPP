@@ -12,6 +12,14 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Ensure /usr/local/go/bin is in PATH for modern Go
+if [ -d "/usr/local/go/bin" ]; then
+    export PATH="/usr/local/go/bin:$PATH"
+fi
+if [ -d "$HOME/go/bin" ]; then
+    export PATH="$HOME/go/bin:$PATH"
+fi
+
 # Function to print colored output
 print_status() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -222,7 +230,7 @@ show_help() {
     echo "Environment Variables:"
     echo "  OPENAI_API_KEY    Your OpenAI API key (required)"
     echo ""
-    echo "Prerequisites:"
+    echo "Prerequisites:"Да, получается, во-первых, сделай, чтобы выделение фрагмента было не по Ctrl,
     echo "  - Go 1.23+ installed"
     echo "  - CGO dependencies (gcc, pkg-config)"
     echo "  - PortAudio development libraries"

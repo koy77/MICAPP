@@ -190,7 +190,7 @@ docker run -it \
 1. Click "Start" to begin recording
 2. Click "Send" (or press Escape) to stop recording and transcribe
 3. Click "Add" to append new transcription to existing text
-4. Use Ctrl+Shift+Drag to capture screenshots
+4. Use Ctrl+Alt+Drag to capture screenshots
 5. Transcribed text is automatically copied to clipboard
 
 ## Environment Variables
