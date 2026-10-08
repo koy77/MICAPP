@@ -163,8 +163,9 @@ func (l *AppLogger) log(level LogLevel, message string, fields ...interface{}) {
 	// Write log message
 	l.logger.Println(logMessage)
 
-	// For FATAL level, also exit the program
+	// For FATAL level, leave a crash trace (crash.log) and exit the program
 	if level == FATAL {
+		crashf("FATAL: %s%s (exiting with code 1)", message, fieldStr)
 		os.Exit(1)
 	}
 }

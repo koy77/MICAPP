@@ -14,13 +14,19 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"image/color"
@@ -36,34 +42,18 @@ import (
 	hook "github.com/robotn/gohook"
 )
 
-// copyToClipboard copies text to clipboard using xclip
+// copyToClipboard copies text to clipboard using xclip (CLIPBOARD + PRIMARY,
+// each with a timeout so a stuck xclip cannot freeze the pipeline).
 func copyToClipboard(text string) error {
-	// Use both PRIMARY and CLIPBOARD selections to be safe
-	// Some apps use one, some use the other
-
 	// 1. Copy to CLIPBOARD (standard Ctrl+V)
-	cmd := exec.Command("xclip", "-selection", "clipboard", "-t", "UTF8_STRING")
-	stdin, err := cmd.StdinPipe()
-	if err == nil {
-		if err := cmd.Start(); err == nil {
-			stdin.Write([]byte(text))
-			stdin.Close()
-			cmd.Wait()
-		}
+	err := clipWrite("clipboard", "UTF8_STRING", []byte(text), 2*time.Second)
+
+	// 2. Copy to PRIMARY (middle click paste) — best effort
+	if perr := clipWrite("primary", "UTF8_STRING", []byte(text), 2*time.Second); perr != nil {
+		log.Printf("clipboard (primary) copy failed: %v", perr)
 	}
 
-	// 2. Copy to PRIMARY (middle click paste)
-	cmdPrimary := exec.Command("xclip", "-selection", "primary", "-t", "UTF8_STRING")
-	stdinP, err := cmdPrimary.StdinPipe()
-	if err == nil {
-		if err := cmdPrimary.Start(); err == nil {
-			stdinP.Write([]byte(text))
-			stdinP.Close()
-			cmdPrimary.Wait()
-		}
-	}
-
-	return nil
+	return err
 }
 
 // copyToClipboard copies text to clipboard using xclip and optionally pastes it
@@ -147,7 +137,7 @@ func (a *AppState) startMouseHook() {
 		a.isMouseHookActive, a.ctrlKeyPressed, a.isSelecting)
 
 	// Start gohook event monitor in separate goroutine
-	go a.monitorGohookEvents()
+	goSafe("gohook-monitor", a.monitorGohookEvents)
 }
 
 // monitorGohookEvents monitors keyboard and mouse events using gohook
@@ -168,7 +158,31 @@ func (a *AppState) monitorGohookEvents() {
 	log.Printf("=== RECORDING TOGGLE: Alt + Q ===")
 
 	eventCount := 0
-	for ev := range events {
+	// Backlog watchdog. gohook buffers up to 1024 events (hook.go: make(chan Event, 1024))
+	// and an x11 mouse easily produces hundreds of events per second. If we consume
+	// slower than they arrive, the queue fills up and every later event — including
+	// the Ctrl-release that triggers a capture — is processed seconds late. That
+	// delay is invisible in the capture timings, so measure the wait in the queue.
+	var maxLag time.Duration
+	var slowEvents int
+	lastLagReport := time.Now()
+
+loop:
+	for {
+		var ev hook.Event
+		select {
+		case e, ok := <-events:
+			if !ok {
+				log.Printf("Gohook event channel closed, stopping monitor")
+				break loop
+			}
+			ev = e
+		default:
+			// Queue is empty — nothing to do, save some CPU.
+			time.Sleep(1 * time.Millisecond)
+			continue
+		}
+
 		eventCount++
 
 		// Check if we should stop
@@ -177,7 +191,28 @@ func (a *AppState) monitorGohookEvents() {
 		a.mouseHookMutex.Unlock()
 		if !active {
 			log.Printf("Mouse hook is no longer active, stopping gohook event monitor")
-			break
+			break loop
+		}
+
+		// How long did this event wait in the gohook queue?
+		if !ev.When.IsZero() {
+			if lag := time.Since(ev.When); lag > 100*time.Millisecond {
+				slowEvents++
+				if lag > maxLag {
+					maxLag = lag
+				}
+				if time.Since(lastLagReport) > 5*time.Second {
+					log.Printf("PERF [events] backlog: waited %dms in queue (max %dms, %d delayed events since last report)",
+						lag.Milliseconds(), maxLag.Milliseconds(), slowEvents)
+					if lag > time.Second {
+						crashf("input backlog: event processed %dms after it arrived (gohook queue is 1024 deep; every capture trigger is delayed by this much)",
+							lag.Milliseconds())
+					}
+					lastLagReport = time.Now()
+					slowEvents = 0
+					maxLag = 0
+				}
+			}
 		}
 
 		switch ev.Kind {
@@ -209,7 +244,7 @@ func (a *AppState) monitorGohookEvents() {
 			// Check for Numpad Plus
 			if ev.Rawcode == 65451 || ev.Keycode == 78 || ev.Keychar == '+' {
 				log.Printf("Numpad Plus detected! Toggling recording...")
-				go a.onRecordButtonClick()
+				goSafe("record-toggle", a.onRecordButtonClick)
 				continue
 			}
 
@@ -217,7 +252,7 @@ func (a *AppState) monitorGohookEvents() {
 			if ev.Rawcode == 65307 || ev.Keycode == 1 || ev.Keychar == 27 {
 				log.Printf("Global Escape detected! Canceling recording...")
 				if a.isRecording {
-					go a.CancelRecording()
+					goSafe("cancel-recording", func() { a.CancelRecording() })
 				}
 				continue
 			}
@@ -265,7 +300,7 @@ func (a *AppState) monitorGohookEvents() {
 
 					// Capture current state values
 					sX, sY := a.startX, a.startY
-					eX, eY := lastX, lastY
+					eX, eY := a.lastX, a.lastY
 
 					// Reset state immediately to prevent double triggers
 					a.isSelecting = false
@@ -274,7 +309,7 @@ func (a *AppState) monitorGohookEvents() {
 					a.mouseHookMutex.Unlock()
 
 					// Pass captured values to the goroutine
-					go a.captureSelectionWithCoords(sX, sY, eX, eY)
+					goSafe("capture-selection", func() { a.captureSelectionWithCoords(sX, sY, eX, eY) })
 				} else {
 					a.mouseHookMutex.Unlock()
 				}
@@ -302,9 +337,6 @@ func (a *AppState) monitorGohookEvents() {
 				}
 			}
 		}
-
-		// Small delay to avoid high CPU usage
-		time.Sleep(1 * time.Millisecond)
 	}
 
 	log.Printf("Gohook event monitor stopped")
@@ -368,6 +400,7 @@ type AppState struct {
 	correctedText      *widget.Entry
 	recordButton       *widget.Button
 	addButton          *widget.Button
+	retranscribeButton *widget.Button
 	statusLabel        fyne.Widget // Can be *widget.Label or *clickableStatusLabel
 	storedAudioList    *widget.List
 	lastTranscription  string
@@ -393,6 +426,7 @@ type AppState struct {
 	processingMutex    sync.Mutex          // Mutex for processing state
 	isProcessing       bool                // Whether audio is being processed
 	shouldCancel       bool                // Flag to cancel processing
+	transcriptionMutex sync.Mutex          // Mutex to serialize transcriptions
 }
 
 // NewAppState creates a new application state
@@ -438,6 +472,7 @@ func NewAppState() (*AppState, error) {
 		correctedText:      nil,
 		recordButton:       nil,
 		addButton:          nil,
+		retranscribeButton: nil,
 		statusLabel:        nil,
 		storedAudioList:    nil,
 		lastTranscription:  "",
@@ -508,15 +543,19 @@ func (a *AppState) StartRecording() error {
 		a.mainIndicator.Show()
 		a.mainIndicator.Refresh()
 	}
-	// Start Python red dot utility
-	go func() {
-		cmd := exec.Command("python3", "./recording-dot.py", "--size", "150")
-		if err := cmd.Start(); err == nil {
-			a.dotProcess = cmd.Process
-		} else {
-			log.Printf("Failed to start recording-dot.py: %v", err)
-		}
-	}()
+	// Start Python red dot utility (Start() is non-blocking, Wait() cleans up in background)
+	cmd := exec.Command("python3", "./recording-dot.py", "--size", "150")
+	if err := cmd.Start(); err == nil {
+		a.dotProcess = cmd.Process
+		// Wait in background to prevent zombie processes
+		goSafe("recording-dot-wait", func() {
+			if err := cmd.Wait(); err != nil {
+				log.Printf("recording-dot.py exited: %v", err)
+			}
+		})
+	} else {
+		log.Printf("Failed to start recording-dot.py: %v", err)
+	}
 
 	// Only update the active button text and color
 	if a.activeButton != nil {
@@ -586,7 +625,8 @@ func (a *AppState) StopRecording() error {
 	setStatusText(a.statusLabel, "Processing...")
 
 	// Process audio in a goroutine to keep UI responsive
-	go a.processAudio()
+	mode := a.recordingMode
+	goSafe("process-audio", func() { a.processAudio(mode) })
 
 	return nil
 }
@@ -724,7 +764,7 @@ func (a *AppState) transcribeWithRetry(wavData []byte, filename string, language
 }
 
 // processAudio processes the recorded audio and sends it to OpenAI asynchronously
-func (a *AppState) processAudio() {
+func (a *AppState) processAudio(mode string) {
 	// Set processing flag
 	a.processingMutex.Lock()
 	a.isProcessing = true
@@ -761,7 +801,7 @@ func (a *AppState) processAudio() {
 		setStatusText(a.statusLabel, "Recording too short (minimum 1 second)")
 
 		// If this was an "add" recording, remove the reserved space
-		if a.recordingMode == "add" {
+		if mode == "add" {
 			currentText := a.correctedText.Text
 			// Remove the last \n\n that we added when starting recording
 			if len(currentText) >= 2 && currentText[len(currentText)-2:] == "\n\n" {
@@ -804,9 +844,11 @@ func (a *AppState) processAudio() {
 	}
 
 	// Save the recording to recordings folder (MP3 128kbps only)
-	lastRecording, err := a.audioStorage.SaveLastRecording(audioBytes, 16000)
+	lastRecording, mp3Data, err := a.audioStorage.SaveLastRecording(audioBytes, 16000)
 	if err != nil {
 		log.Printf("Failed to save recording: %v", err)
+		// Fallback to raw PCM if MP3 conversion failed (though SaveLastRecording should handle it)
+		mp3Data = nil
 	} else {
 		log.Printf("Recording saved as: %s", lastRecording)
 	}
@@ -823,7 +865,12 @@ func (a *AppState) processAudio() {
 	}
 
 	// Add to transcription queue (asynchronous)
-	a.addToQueue(audioBytes, a.recordingMode)
+	// Use mp3Data if available, otherwise use audioBytes (processQueueItem will convert)
+	if mp3Data != nil {
+		a.addToQueue(mp3Data, mode, true)
+	} else {
+		a.addToQueue(audioBytes, mode, false)
+	}
 	setStatusText(a.statusLabel, fmt.Sprintf("Processing... (%d in queue)", len(a.transcriptionQueue)))
 
 	// Update stored audio list
@@ -884,6 +931,76 @@ func (a *AppState) onAddButtonClick() {
 	}
 }
 
+// onRetranscribeFile re-sends a specific stored audio file for transcription
+func (a *AppState) onRetranscribeFile(filename string) {
+	if a.isRecording {
+		setStatusText(a.statusLabel, "Cannot retranscribe while recording")
+		return
+	}
+
+	filePath := a.audioStorage.GetAudioFilePath(filename)
+	mp3Data, err := os.ReadFile(filePath)
+	if err != nil {
+		setStatusText(a.statusLabel, fmt.Sprintf("Failed to read file: %v", err))
+		log.Printf("Retranscribe file failed: %v", err)
+		return
+	}
+
+	// Use "add" mode to append to existing text
+	a.recordingMode = "add"
+
+	// Reserve space by adding a new line
+	currentText := strings.TrimSpace(a.correctedText.Text)
+	if currentText != "" {
+		currentText += "\n\n"
+	}
+	a.correctedText.SetText(currentText)
+
+	// Add to transcription queue
+	a.addToQueue(mp3Data, "add", true)
+	setStatusText(a.statusLabel, fmt.Sprintf("Retranscribing %s... (%d in queue)", filename, len(a.transcriptionQueue)))
+	log.Printf("Retranscribe file queued: %s (%d bytes)", filename, len(mp3Data))
+}
+
+// formatSize formats bytes to human-readable size (KB or MB)
+func formatSize(size int64) string {
+	if size >= 1024*1024 {
+		return fmt.Sprintf("%.1f MB", float64(size)/(1024*1024))
+	}
+	return fmt.Sprintf("%d KB", size/1024)
+}
+
+// onRetranscribeClick re-sends the last recording for transcription
+func (a *AppState) onRetranscribeClick() {
+	if a.isRecording {
+		setStatusText(a.statusLabel, "Cannot retranscribe while recording")
+		return
+	}
+
+	// Get the last saved recording
+	filename, mp3Data, err := a.audioStorage.GetLastRecordingData()
+	if err != nil {
+		setStatusText(a.statusLabel, fmt.Sprintf("No recording to retranscribe: %v", err))
+		log.Printf("Retranscribe failed: %v", err)
+		return
+	}
+
+	// Use "add" mode to append to existing text
+	a.recordingMode = "add"
+
+	// Reserve space by adding a new line
+	currentText := strings.TrimSpace(a.correctedText.Text)
+	if currentText != "" {
+		currentText += "\n\n"
+	}
+	a.correctedText.SetText(currentText)
+
+	// Add to transcription queue
+	a.addToQueue(mp3Data, "add", true)
+	setStatusText(a.statusLabel, fmt.Sprintf("Retranscribing %s... (%d in queue)", filename, len(a.transcriptionQueue)))
+	log.Printf("Retranscribe queued: %s", filename)
+}
+
 // updateQueueIndicators updates the visual queue indicators
 func (a *AppState) updateQueueIndicators() {
 	if a.queueContainer == nil {
@@ -925,7 +1042,7 @@ func (a *AppState) setFirstIndicatorDownload() {
 }
 
 // addToQueue adds a transcription request to the queue
-func (a *AppState) addToQueue(audioData []byte, mode string) {
+func (a *AppState) addToQueue(audioData []byte, mode string, isMp3 bool) {
 	// Check if audio data is not empty
 	if len(audioData) == 0 {
 		setStatusText(a.statusLabel, "No audio data to process")
@@ -937,11 +1054,15 @@ func (a *AppState) addToQueue(audioData []byte, mode string) {
 	a.updateQueueIndicators()
 
 	// Process asynchronously
-	go a.processQueueItem(audioData, mode)
+	goSafe("process-queue-item", func() { a.processQueueItem(audioData, mode, isMp3) })
 }
 
 // processQueueItem processes a single queue item
-func (a *AppState) processQueueItem(audioData []byte, mode string) {
+func (a *AppState) processQueueItem(audioData []byte, mode string, isMp3 bool) {
+	// Serialize transcriptions to prevent resource competition and race conditions
+	a.transcriptionMutex.Lock()
+	defer a.transcriptionMutex.Unlock()
+
 	defer func() {
 		// Remove from queue when done
 		if len(a.transcriptionQueue) > 0 {
@@ -974,12 +1095,19 @@ func (a *AppState) processQueueItem(audioData []byte, mode string) {
 	log.Printf("processQueueItem: starting new transcription, shouldCancel reset to false")
 	a.processingMutex.Unlock()
 
-	// Convert to MP3 128kbps for transcription (smaller file size, faster upload)
-	mp3Data, err := a.audioStorage.ConvertToMP3(audioData, 16000, 128)
-	if err != nil {
-		log.Printf("Failed to convert to MP3, falling back to WAV: %v", err)
-		// Fallback to WAV if MP3 conversion fails
-		mp3Data = CreateWAVFile(audioData, 16000, 1)
+	var mp3Data []byte
+	var err error
+
+	if isMp3 {
+		mp3Data = audioData
+	} else {
+		// Convert to MP3 128kbps for transcription (smaller file size, faster upload)
+		mp3Data, err = a.audioStorage.ConvertToMP3(audioData, 16000, 128)
+		if err != nil {
+			log.Printf("Failed to convert to MP3, falling back to WAV: %v", err)
+			// Fallback to WAV if MP3 conversion fails
+			mp3Data = CreateWAVFile(audioData, 16000, 1)
+		}
 	}
 
 	// Check for cancel before transcribing
@@ -1061,29 +1189,11 @@ func (a *AppState) processQueueItem(audioData []byte, mode string) {
 	log.Printf("processQueueItem: button reset to initial state after transcription")
 }
 
-// updateStoredAudioList updates the stored audio list widget
+// updateStoredAudioList refreshes the stored audio list widget
 func (a *AppState) updateStoredAudioList() {
 	if a.storedAudioList == nil {
 		return
 	}
-
-	audioFiles, err := a.audioStorage.GetStoredAudioFiles()
-	if err != nil {
-		log.Printf("Failed to get stored audio files: %v", err)
-		return
-	}
-
-	// Create list data
-	var listData []string
-	for _, file := range audioFiles {
-		listItem := fmt.Sprintf("%s (%dkbps, %s)",
-			file.Filename,
-			file.Bitrate,
-			file.Timestamp.Format("15:04:05"))
-		listData = append(listData, listItem)
-	}
-
-	// Update list widget
 	a.storedAudioList.Refresh()
 }
 
@@ -1113,36 +1223,66 @@ func loadEnv() {
 	}
 }
 
+// stdoutWatcher detects that stdout is gone (broken pipe / closed journald
+// socket) and records it once, instead of letting every later write fail silently.
+type stdoutWatcher struct {
+	w    io.Writer
+	once sync.Once
+}
+
+func (s *stdoutWatcher) Write(p []byte) (int, error) {
+	n, err := s.w.Write(p)
+	if err != nil {
+		s.once.Do(func() {
+			// Runs while the log package's mutex is held: write straight to
+			// crash.log, never through log.Printf (that would deadlock).
+			appendCrashLine(fmt.Sprintf("stdout write failed (%v) — stdout is gone (broken pipe); logging continues to app.log only", err))
+		})
+	}
+	return n, err
+}
+
 func main() {
+	// A panic that escapes main only reaches stderr, which is lost when the app
+	// is started from the desktop launcher — log it to crash.log and keep the
+	// session marker honest about how this run ended.
+	defer func() {
+		if r := recover(); r != nil {
+			crashf("PANIC in main goroutine: %v\n%s", r, debug.Stack())
+			writeSessionMarker(false)
+		}
+	}()
+
 	// Configure logging to write to both app.log and stdout
-	logFile, err := os.OpenFile("app.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	logName := "app.log"
+	if os.Getenv("MICAPP_SMOKE_TEST") == "1" {
+		logName = "app.log.smoke" // keep a running instance's log intact during smoke tests
+	}
+	logFile, err := os.OpenFile(logName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil {
 		log.Printf("Failed to open log file: %v, logging to stderr", err)
 	} else {
 		defer logFile.Close()
-		// Use MultiWriter to log to both file and stdout
-		multi := io.MultiWriter(logFile, os.Stdout)
+		// Use MultiWriter to log to both file and stdout (stdout is watched:
+		// a vanished pipe/journald socket must not kill the app via SIGPIPE)
+		multi := io.MultiWriter(logFile, &stdoutWatcher{w: os.Stdout})
 		log.SetOutput(multi)
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
 	log.Printf("=== MICAPP STARTED ===")
 
+	// Crash / critical-error logging setup
+	checkPreviousSession()
+	writeSessionMarker(false)
+	installCrashHandlers()
+	log.Printf("runtime %s, GOMAXPROCS=%d, CPUs=%d", runtime.Version(), runtime.GOMAXPROCS(0), runtime.NumCPU())
+
 	// Load .env file
 	loadEnv()
 
-	// Check if OpenAI API key is set
-	key := os.Getenv("OPENAI_API_KEY")
-	if key == "" {
-		log.Printf("ERROR: OPENAI_API_KEY environment variable is not set.")
-	} else {
-		maskedKey := ""
-		if len(key) > 8 {
-			maskedKey = key[:4] + "..." + key[len(key)-4:]
-		} else {
-			maskedKey = "****"
-		}
-		log.Printf("OPENAI_API_KEY is set: %s", maskedKey)
-	}
+	// The transcription provider (TRANSCRIBE_PROVIDER=openai|groq) and its API
+	// key are validated by NewOpenAiSpeechClient, which logs the active
+	// provider/model/url right after creation. Nothing to check here.
 
 	// Create application state
 	log.Printf("Initializing AppState...")
@@ -1193,6 +1333,9 @@ func main() {
 	appState.addButton = widget.NewButton("Add", appState.onAddButtonClick)
 	appState.addButton.Resize(fyne.NewSize(100, 40))
 
+	appState.retranscribeButton = widget.NewButton("Re-Transcribe", appState.onRetranscribeClick)
+	appState.retranscribeButton.Resize(fyne.NewSize(100, 40))
+
 	// Create recording indicators
 	mainIndicatorCircle := canvas.NewCircle(color.RGBA{R: 255, G: 0, B: 0, A: 255})
 	mainIndicatorCircle.StrokeWidth = 0
@@ -1210,24 +1353,52 @@ func main() {
 	statusLabelWidget.Wrapping = fyne.TextWrapWord // Enable wrapping to prevent horizontal expansion
 	appState.statusLabel = statusLabelWidget
 
-	// Create stored audio list
+	// Create stored audio list with multi-column layout
 	appState.storedAudioList = widget.NewList(
 		func() int {
 			audioFiles, _ := appState.audioStorage.GetStoredAudioFiles()
 			return len(audioFiles)
 		},
 		func() fyne.CanvasObject {
-			return widget.NewLabel("Template")
+			sendBtn := widget.NewButtonWithIcon("", theme.UploadIcon(), nil)
+			sendBtn.Importance = widget.LowImportance
+			durationLabel := widget.NewLabel("0s")
+			durationLabel.Alignment = fyne.TextAlignCenter
+			sizeLabel := widget.NewLabel("0 KB")
+			sizeLabel.Alignment = fyne.TextAlignCenter
+			nameLabel := widget.NewLabel("file.mp3")
+			nameLabel.Truncation = fyne.TextTruncateEllipsis
+
+			return container.NewBorder(
+				nil, nil,
+				container.NewHBox(sendBtn, durationLabel, sizeLabel),
+				nil,
+				nameLabel,
+			)
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
 			audioFiles, _ := appState.audioStorage.GetStoredAudioFiles()
-			if id < len(audioFiles) {
-				file := audioFiles[id]
-				label := obj.(*widget.Label)
-				label.SetText(fmt.Sprintf("%s (%dkbps, %s)",
-					file.Filename,
-					file.Bitrate,
-					file.Timestamp.Format("15:04:05")))
+			if id >= len(audioFiles) {
+				return
+			}
+			file := audioFiles[id]
+
+			border := obj.(*fyne.Container)
+			// NewBorder order: [top, bottom, left, right, center]
+			leftBox := border.Objects[2].(*fyne.Container) // HBox with button, duration, size
+			sendBtn := leftBox.Objects[0].(*widget.Button)
+			durationLabel := leftBox.Objects[1].(*widget.Label)
+			sizeLabel := leftBox.Objects[2].(*widget.Label)
+			nameLabel := border.Objects[4].(*widget.Label)
+
+			durationLabel.SetText(fmt.Sprintf("%ds", int(file.Duration.Seconds())))
+			sizeLabel.SetText(formatSize(file.Size))
+			nameLabel.SetText(file.Filename)
+
+			// Bind retranscribe action to this file
+			filename := file.Filename
+			sendBtn.OnTapped = func() {
+				appState.onRetranscribeFile(filename)
 			}
 		},
 	)
@@ -1240,6 +1411,7 @@ func main() {
 	buttonContainer := container.NewHBox(
 		appState.recordButton,
 		appState.addButton,
+		appState.retranscribeButton,
 		appState.mainIndicator,
 		widget.NewSeparator(),
 		queueContainer,
@@ -1316,14 +1488,18 @@ func main() {
 	})
 
 	// Start mouse hook for Ctrl+drag screenshot capture
-	appState.startMouseHook()
-	defer appState.stopMouseHook()
+	smokeTest := os.Getenv("MICAPP_SMOKE_TEST") == "1"
+	if !smokeTest {
+		appState.startMouseHook()
+		defer appState.stopMouseHook()
 
-	// Ensure no lingering recording dots on startup
-	exec.Command("pkill", "-f", "recording-dot.py").Run()
+		// Ensure no lingering recording dots on startup
+		exec.Command("pkill", "-f", "recording-dot.py").Run()
+	}
 
 	// Set close intercept to close image editor window if open
 	myWindow.SetCloseIntercept(func() {
+		atomic.StoreInt32(&appShuttingDown, 1)
 		// Close image editor window if it's open
 		if appState.imageEditorWindow != nil {
 			log.Printf("Closing image editor window along with main window")
@@ -1344,9 +1520,27 @@ func main() {
 	myWindow.Show()
 	log.Printf("myWindow.Show() called")
 
+	// Exit (and log) if the process ever ends up with zero windows while running
+	startWindowWatchdog()
+
+	// Optional smoke test: MICAPP_SMOKE_TEST=1 exercises the capture→editor
+	// pipeline with a synthetic image and quits, so a fresh build can be
+	// verified without a manual run.
+	if smokeTest {
+		goSafe("smoke-test", func() {
+			time.Sleep(1500 * time.Millisecond)
+			data := smokeTestImage()
+			log.Printf("SMOKE: opening editor with %d-byte synthetic image", len(data))
+			openImageEditorWithAppState(data, appState)
+			time.Sleep(2500 * time.Millisecond)
+			log.Printf("SMOKE: editor pipeline exercised, %s", perfState())
+			myApp.Quit()
+		})
+	}
+
 	// Move window to X=0, Y=200 position (Linux only, using xdotool)
 	// This is done after Show() to ensure window is created
-	go func() {
+	goSafe("xdotool-positioning", func() {
 		log.Printf("Starting window positioning goroutine")
 		// Small delay to ensure window is fully created
 		time.Sleep(2 * time.Second)
@@ -1369,10 +1563,31 @@ func main() {
 				log.Printf("Window moved and set to always-on-top successfully")
 			}
 		}
-	}()
+	})
 
 	// Run application
 	log.Printf("Calling myApp.Run()...")
 	myApp.Run()
+	atomic.StoreInt32(&appShuttingDown, 1)
 	log.Printf("myApp.Run() finished")
+
+	// Mark the session as cleanly exited while the log file is still open.
+	// (The recover defer above stays silent on the normal path.)
+	writeSessionMarker(true)
+	log.Printf("=== MICAPP EXITED CLEANLY ===")
+}
+
+// smokeTestImage builds a small PNG test pattern for MICAPP_SMOKE_TEST runs.
+func smokeTestImage() []byte {
+	img := image.NewRGBA(image.Rect(0, 0, 700, 400))
+	for y := 0; y < 400; y++ {
+		for x := 0; x < 700; x++ {
+			img.Set(x, y, color.RGBA{R: uint8(x % 256), G: uint8(y % 256), B: 128, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil
+	}
+	return buf.Bytes()
 }

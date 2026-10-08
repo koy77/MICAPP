@@ -8,6 +8,7 @@ require (
 	github.com/gordonklaus/portaudio v0.0.0-20230709114228-aafa478834f5
 	github.com/gorilla/websocket v1.5.3
 	github.com/robotn/gohook v0.42.2
+	github.com/vcaesar/screenshot v0.11.1
 )
 
 require (
@@ -48,7 +49,6 @@ require (
 	github.com/vcaesar/gops v0.41.0 // indirect
 	github.com/vcaesar/imgo v0.41.0 // indirect
 	github.com/vcaesar/keycode v0.10.1 // indirect
-	github.com/vcaesar/screenshot v0.11.1 // indirect
 	github.com/vcaesar/tt v0.20.1 // indirect
 	github.com/yuin/goldmark v1.5.5 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect

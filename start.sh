@@ -12,13 +12,32 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Ensure /usr/local/go/bin is in PATH for modern Go
+# Ensure Go and CGO toolchain are on PATH
+if [ -d "$HOME/.local/go-install/bin" ]; then
+    export PATH="$HOME/.local/go-install/bin:$PATH"
+fi
 if [ -d "/usr/local/go/bin" ]; then
     export PATH="/usr/local/go/bin:$PATH"
 fi
 if [ -d "$HOME/go/bin" ]; then
     export PATH="$HOME/go/bin:$PATH"
 fi
+
+# User-local build deps (used when system gcc/dev packages are not installed)
+MICAPP_DEPS="$HOME/micapp-deps"
+setup_build_env() {
+    if [ -x "$MICAPP_DEPS/usr/bin/gcc" ]; then
+        export PATH="$MICAPP_DEPS/usr/bin:$PATH"
+        export PKG_CONFIG_PATH="$MICAPP_DEPS/usr/lib/x86_64-linux-gnu/pkgconfig:$MICAPP_DEPS/usr/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        export LD_LIBRARY_PATH="$MICAPP_DEPS/usr/lib/x86_64-linux-gnu:$MICAPP_DEPS/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        export CC="$MICAPP_DEPS/usr/bin/gcc --sysroot=$MICAPP_DEPS"
+        export CXX="$MICAPP_DEPS/usr/bin/g++ --sysroot=$MICAPP_DEPS"
+        export CGO_CFLAGS="--sysroot=$MICAPP_DEPS"
+        export CGO_LDFLAGS="--sysroot=$MICAPP_DEPS -L$MICAPP_DEPS/usr/lib/x86_64-linux-gnu"
+        export MICAPP_EXT_LDFLAGS="-extldflags \"-L$MICAPP_DEPS/usr/lib/x86_64-linux-gnu -lXau -lXdmcp -lXext -ljack -lstdc++\""
+    fi
+}
+setup_build_env
 
 # Function to print colored output
 print_status() {
@@ -61,6 +80,12 @@ check_prerequisites() {
     
     GO_VERSION=$(go version)
     print_success "Go is installed: $GO_VERSION"
+
+    if ! command_exists gcc; then
+        print_error "gcc not found. Install build-essential or ensure $MICAPP_DEPS is set up."
+        exit 1
+    fi
+    print_success "C compiler: $(gcc --version | head -1)"
     
     # Check if we're in the correct directory
     if [ ! -d "code" ]; then
@@ -124,7 +149,11 @@ build_app() {
     
     # Build the application
     print_status "Compiling application..."
-    CGO_ENABLED=1 go build -ldflags='-s -w' -o micapp ./code
+    if [ -n "$MICAPP_EXT_LDFLAGS" ]; then
+        CGO_ENABLED=1 go build -ldflags="-s -w" -ldflags="$MICAPP_EXT_LDFLAGS" -o micapp ./code
+    else
+        CGO_ENABLED=1 go build -ldflags="-s -w" -o micapp ./code
+    fi
     
     if [ $? -eq 0 ]; then
         # Make executable
@@ -159,7 +188,7 @@ install_app() {
 [Desktop Entry]
 Name=MICAPP
 Comment=Voice Transcription Tool
-Exec=$(pwd)/micapp
+Exec=$(pwd)/run-micapp.sh
 Icon=$(pwd)/red_cube_icon.png
 Path=$(pwd)
 Terminal=false

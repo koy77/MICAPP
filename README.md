@@ -4,7 +4,7 @@ Voice transcription application with GUI built with Go and Fyne framework.
 
 ## Features
 
-- Voice recording and transcription using OpenAI Whisper API
+- Voice recording and transcription via switchable providers: **Deepgram (nova-3)**, **Groq (whisper-large-v3-turbo)** or **OpenAI Whisper**
 - GUI interface built with Fyne
 - Audio storage with rotation (keeps last 10 recordings)
 - WebSocket API for real-time text updates (`ws://localhost:8989/ws`)
@@ -12,6 +12,7 @@ Voice transcription application with GUI built with Go and Fyne framework.
 - Always-on-top window behavior
 - Text correction using LLM
 - Screenshot capture functionality
+- Crash/perf diagnostics: `crash.log`, `.micapp.session`, ms timings in `app.log`, `perf-report.sh`
 
 ## WebSocket API
 
@@ -47,10 +48,18 @@ Sent whenever the transcription is updated.
 
 ## Quick Start
 
-### Set your OpenAI API key (required for both methods):
-```bash
-export OPENAI_API_KEY="your-api-key-here"
+### Configure transcription (`.env` in the project root):
+
+```ini
+TRANSCRIBE_PROVIDER=deepgram        # deepgram | groq | openai
+DEEPGRAM_API_KEY=your-key-here      # https://console.deepgram.com
+# GROQ_API_KEY=...                  # https://console.groq.com/keys
+# OPENAI_API_KEY=...                # https://platform.openai.com/api-keys
 ```
+
+The app loads `.env` at startup (variables already present in the environment win).
+If the selected provider has no key, the app logs a warning and automatically
+falls back to another configured provider instead of failing to start.
 
 ---
 
@@ -173,6 +182,9 @@ docker build -t micapp:latest .
 docker run -it \
   --rm \
   -e DISPLAY=$DISPLAY \
+  -e TRANSCRIBE_PROVIDER=$TRANSCRIBE_PROVIDER \
+  -e DEEPGRAM_API_KEY=$DEEPGRAM_API_KEY \
+  -e GROQ_API_KEY=$GROQ_API_KEY \
   -e OPENAI_API_KEY=$OPENAI_API_KEY \
   -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
   -v /tmp/pulse-socket:/tmp/pulse-socket \
@@ -197,7 +209,22 @@ docker run -it \
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENAI_API_KEY` | Yes | Your OpenAI API key for transcription |
+| `TRANSCRIBE_PROVIDER` | No | `deepgram` \| `groq` \| `openai` (default: `openai`) |
+| `DEEPGRAM_API_KEY` | for `deepgram` | Deepgram API key (model `nova-3`, ~$0.0043/min pre-recorded) |
+| `GROQ_API_KEY` | for `groq` | Groq API key (model `whisper-large-v3-turbo`, ~$0.04/audio-hour) |
+| `OPENAI_API_KEY` | for `openai` | OpenAI API key (model `whisper-1`) |
+
+Optional per-provider overrides: `DEEPGRAM_MODEL`, `DEEPGRAM_BASE_URL`,
+`GROQ_TRANSCRIBE_MODEL`, `GROQ_BASE_URL`, `OPENAI_TRANSCRIBE_MODEL`, `OPENAI_BASE_URL`.
+
+Switching providers = one line in `.env` + restart the app.
+
+## Diagnostics & Logging
+
+- `app.log` — per-run log; `PERF [capture #N] …` lines carry millisecond timings for the whole capture → editor → visible pipeline.
+- `crash.log` — panics (with stack traces), fatal signals, slow editor opens, input-queue backlog, xclip timeouts. `kill -USR1 <pid>` dumps all goroutine stacks into it on demand.
+- `.micapp.session` — clean-exit marker; the next start reports whether the previous session crashed or was killed.
+- `./perf-report.sh` — compact summary of the diagnostics above.
 
 ## Troubleshooting
 

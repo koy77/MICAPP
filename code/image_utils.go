@@ -10,8 +10,9 @@ import (
 	"image/png"
 	"log"
 	"math"
-	"os/exec"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -20,97 +21,167 @@ import (
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
 	"github.com/go-vgo/robotgo"
+	"github.com/vcaesar/screenshot"
 )
 
-// copyImageToClipboard copies image to clipboard using xclip
+// copyImageToClipboard copies image to clipboard using xclip (with a timeout,
+// so a stuck xclip cannot freeze the capture pipeline).
 func copyImageToClipboard(imageData []byte) error {
-	cmd := exec.Command("xclip", "-selection", "clipboard", "-t", "image/png")
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return err
-	}
-
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-
-	if _, err := stdin.Write(imageData); err != nil {
-		return err
-	}
-
-	if err := stdin.Close(); err != nil {
-		return err
-	}
-
-	return cmd.Wait()
+	return clipWrite("clipboard", "image/png", imageData, 3*time.Second)
 }
 
-// captureScreenRegion captures a region of the screen.
-// It first takes a full-screen screenshot and then crops the desired region.
+func encodePNG(img image.Image) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// cropImage extracts a rectangular region from a captured screen image.
+func cropImage(src *image.RGBA, x, y, width, height int) *image.RGBA {
+	srcBounds := src.Bounds()
+	cropRect := image.Rect(x, y, x+width, y+height).Add(srcBounds.Min)
+	intersect := srcBounds.Intersect(cropRect)
+	if intersect.Empty() {
+		return nil
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	draw.Draw(dst, intersect.Sub(cropRect.Min), src, intersect.Min, draw.Src)
+	return dst
+}
+
+// captureScreenRegion captures a region of the screen using native Go libraries.
+// It tries a direct region capture first, then falls back to full-display capture + crop.
 func captureScreenRegion(x, y, width, height int) ([]byte, error) {
 	log.Printf("captureScreenRegion called with x=%d, y=%d, width=%d, height=%d", x, y, width, height)
 
-	// Try to capture using maim first (highly reliable on Linux X11)
-	if _, err := exec.LookPath("maim"); err == nil {
-		log.Printf("Using maim for capture")
-		// maim -g WIDTHxHEIGHT+X+Y
-		geometry := fmt.Sprintf("%dx%d+%d+%d", width, height, x, y)
-		log.Printf("Running command: maim -g %s", geometry)
-		cmd := exec.Command("maim", "-g", geometry)
-		var out bytes.Buffer
-		var stderr bytes.Buffer
-		cmd.Stdout = &out
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err == nil && out.Len() > 0 {
-			log.Printf("Maim capture successful, size: %d bytes", out.Len())
-			return out.Bytes(), nil
+	img, err := screenshot.Capture(x, y, width, height)
+	if err == nil && img != nil {
+		if data, encErr := encodePNG(img); encErr == nil && len(data) > 0 {
+			log.Printf("Native region capture successful, size: %d bytes", len(data))
+			return data, nil
+		} else if encErr != nil {
+			log.Printf("Failed to encode region capture: %v", encErr)
 		}
-		log.Printf("Maim capture failed: %v, stderr: %s", err, stderr.String())
 	} else {
-		log.Printf("maim not found in PATH")
+		log.Printf("Native region capture failed: %v", err)
 	}
 
-	// Try ImageMagick import as second choice
-	if _, err := exec.LookPath("import"); err == nil {
-		log.Printf("Using ImageMagick import for capture")
-		// import -window root -crop WIDTHxHEIGHT+X+Y png:-
-		geometry := fmt.Sprintf("%dx%d+%d+%d", width, height, x, y)
-		log.Printf("Running command: import -window root -crop %s png:-", geometry)
-		cmd := exec.Command("import", "-window", "root", "-crop", geometry, "png:-")
-		var out bytes.Buffer
-		var stderr bytes.Buffer
-		cmd.Stdout = &out
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err == nil && out.Len() > 0 {
-			log.Printf("Import capture successful, size: %d bytes", out.Len())
-			return out.Bytes(), nil
+	for displayIndex := 0; displayIndex < screenshot.NumActiveDisplays(); displayIndex++ {
+		displayBounds := screenshot.GetDisplayBounds(displayIndex)
+		region := image.Rect(x, y, x+width, y+height)
+		if displayBounds.Intersect(region).Empty() {
+			continue
 		}
-		log.Printf("Import capture failed: %v, stderr: %s", err, stderr.String())
-	} else {
-		log.Printf("import not found in PATH")
-	}
 
-	// Fallback to robotgo (might produce black images on some X11 setups)
-	log.Printf("Falling back to robotgo for capture")
-	screenBitmap := robotgo.CaptureScreen(x, y, width, height)
-	if screenBitmap != nil {
-		defer robotgo.FreeBitmap(screenBitmap)
-		img := robotgo.ToImage(screenBitmap)
-		if img != nil {
-			var buf bytes.Buffer
-			if err := png.Encode(&buf, img); err == nil {
-				return buf.Bytes(), nil
-			}
+		displayImg, err := screenshot.CaptureDisplay(displayIndex)
+		if err != nil {
+			log.Printf("Display %d capture failed: %v", displayIndex, err)
+			continue
 		}
+
+		relX := x - displayBounds.Min.X
+		relY := y - displayBounds.Min.Y
+		cropped := cropImage(displayImg, relX, relY, width, height)
+		if cropped == nil {
+			continue
+		}
+
+		data, err := encodePNG(cropped)
+		if err != nil {
+			log.Printf("Failed to encode cropped display %d capture: %v", displayIndex, err)
+			continue
+		}
+
+		log.Printf("Display %d crop capture successful, size: %d bytes", displayIndex, len(data))
+		return data, nil
 	}
 
-	return nil, fmt.Errorf("all capture methods failed")
+	return nil, fmt.Errorf("native screen capture failed for region %dx%d+%d+%d", width, height, x, y)
 }
 
 var (
 	lastCaptureTime sync.Map   // Map of app state pointer to last capture time
 	captureMutex    sync.Mutex // Global mutex to prevent concurrent captures opening multiple windows
 )
+
+// PERF instrumentation. The capture pipeline runs on a capture goroutine while
+// the first-paint marker fires on the Fyne render thread, hence the atomics.
+var (
+	perfCaptureStartNanos int64 // UnixNano of the current capture start (0 = inactive)
+	perfCaptureNum        int64 // running number of the current capture
+	perfEditorOpenNanos   int64 // UnixNano when the current editor window started opening
+	perfEditorClosed      int32 // 1 after the current editor window got closed
+)
+
+// perfStartCapture marks the start of a new capture→editor pipeline run.
+func perfStartCapture() int64 {
+	num := atomic.AddInt64(&perfCaptureNum, 1)
+	atomic.StoreInt64(&perfCaptureStartNanos, time.Now().UnixNano())
+	atomic.StoreInt64(&perfEditorOpenNanos, 0)
+	atomic.StoreInt32(&perfEditorClosed, 0)
+	return num
+}
+
+func perfCurNum() int64 { return atomic.LoadInt64(&perfCaptureNum) }
+
+// perfAgeMs returns ms since the capture pipeline started, or -1 when inactive.
+func perfAgeMs() int64 {
+	start := atomic.LoadInt64(&perfCaptureStartNanos)
+	if start == 0 {
+		return -1
+	}
+	return (time.Now().UnixNano() - start) / int64(time.Millisecond)
+}
+
+// perfAge returns ms since the capture pipeline started, or "n/a"
+func perfAge() string {
+	if ms := perfAgeMs(); ms >= 0 {
+		return fmt.Sprintf("%dms", ms)
+	}
+	return "n/a"
+}
+
+// perfStageMs returns ms since the given UnixNano mark, or -1 when unset.
+func perfStageMs(markNanos int64) int64 {
+	if markNanos == 0 {
+		return -1
+	}
+	return (time.Now().UnixNano() - markNanos) / int64(time.Millisecond)
+}
+
+// perfWindows returns the number of live top-level windows (-1 = app not ready).
+func perfWindows() int {
+	app := fyne.CurrentApp()
+	if app == nil || app.Driver() == nil {
+		return -1
+	}
+	return len(app.Driver().AllWindows())
+}
+
+func windowTitles() []string {
+	app := fyne.CurrentApp()
+	if app == nil || app.Driver() == nil {
+		return nil
+	}
+	var titles []string
+	for _, w := range app.Driver().AllWindows() {
+		if w != nil {
+			titles = append(titles, w.Title())
+		}
+	}
+	return titles
+}
+
+// perfState returns a compact runtime snapshot for leak hunting
+func perfState() string {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return fmt.Sprintf("goroutines=%d heap=%dMB sys=%dMB gc=%d windows=%d",
+		runtime.NumGoroutine(), m.HeapAlloc/1024/1024, m.Sys/1024/1024, m.NumGC, perfWindows())
+}
 
 // captureSelectionWithCoords captures the selected region as screenshot using provided coordinates
 func (a *AppState) captureSelectionWithCoords(startX, startY, endX, endY int) {
@@ -121,25 +192,29 @@ func (a *AppState) captureSelectionWithCoords(startX, startY, endX, endY int) {
 	now := time.Now()
 	if val, ok := lastCaptureTime.Load(a); ok {
 		if lastTime, ok := val.(time.Time); ok {
-			if now.Sub(lastTime) < 1000*time.Millisecond {
-				log.Printf("captureSelection: skipping duplicate call within cooldown period (1s)")
+			if now.Sub(lastTime) < 300*time.Millisecond {
+				log.Printf("captureSelection: skipping duplicate call within cooldown period (300ms)")
 				return
 			}
 		}
 	}
 	lastCaptureTime.Store(a, now)
 
+	captureNum := perfStartCapture()
+	t0 := time.Now()
+	lastMark := t0
+	mark := func(label string) {
+		nowT := time.Now()
+		log.Printf("PERF [capture #%d] %s: +%dms (total %dms)", captureNum, label, nowT.Sub(lastMark).Milliseconds(), nowT.Sub(t0).Milliseconds())
+		lastMark = nowT
+	}
+
+	log.Printf("PERF [capture #%d] START selection=(%d,%d)-(%d,%d) state: %s", captureNum, startX, startY, endX, endY, perfState())
 	log.Printf("captureSelectionWithCoords (under lock) called with: start=(%d, %d), end=(%d, %d)", startX, startY, endX, endY)
 
 	if startX == 0 && startY == 0 && endX == 0 && endY == 0 {
 		log.Printf("Warning: Selection coordinates are all zero, skipping capture")
 		return
-	}
-
-	// If end coordinates are zero, use current mouse position (though they shouldn't be now)
-	if endX == 0 && endY == 0 {
-		endX, endY = robotgo.GetMousePos()
-		log.Printf("End coordinates were zero, using current mouse position: (%d, %d)", endX, endY)
 	}
 
 	log.Printf("Selection region (before normalization): start=(%d, %d), end=(%d, %d)", startX, startY, endX, endY)
@@ -178,14 +253,19 @@ func (a *AppState) captureSelectionWithCoords(startX, startY, endX, endY int) {
 		log.Printf("Failed to capture screenshot: %v", err)
 	} else {
 		log.Printf("Screenshot captured successfully, size: %d bytes", len(imageData))
-		// Update UI with captured image
-		a.updateCapturedImage(imageData)
+		mark("screen capture + png encode")
 		// Close all existing editor windows before opening new one
 		log.Printf("Closing all existing image editor windows")
 		closeAllImageEditorWindows(a)
+		mark("close old editor windows")
 		// Automatically open image editor with captured image
 		log.Printf("Opening image editor automatically after capture")
 		openImageEditorWithAppState(imageData, a)
+		mark("editor window created (Show returned)")
+		// Update UI and paste in background to avoid blocking the editor window
+		goSafe("update-captured-image", func() { a.updateCapturedImage(imageData) })
+		mark("pipeline done")
+		log.Printf("PERF [capture #%d] state: %s", captureNum, perfState())
 	}
 }
 
@@ -200,6 +280,14 @@ func (a *AppState) captureSelection() {
 
 // updateCapturedImage updates the UI with the captured image
 func (a *AppState) updateCapturedImage(imageData []byte) {
+	captureNum := perfCurNum()
+	t0 := time.Now()
+	lastMark := t0
+	mark := func(label string) {
+		nowT := time.Now()
+		log.Printf("PERF [post #%d] %s: +%dms (total %dms)", captureNum, label, nowT.Sub(lastMark).Milliseconds(), nowT.Sub(t0).Milliseconds())
+		lastMark = nowT
+	}
 	log.Printf("updateCapturedImage called, image size: %d bytes", len(imageData))
 	a.imageData = imageData
 
@@ -211,6 +299,7 @@ func (a *AppState) updateCapturedImage(imageData []byte) {
 	}
 
 	log.Printf("Image decoded successfully")
+	mark("verify decode")
 
 	// Create image resource
 	resource := fyne.NewStaticResource("captured.png", imageData)
@@ -261,6 +350,7 @@ func (a *AppState) updateCapturedImage(imageData []byte) {
 	}
 
 	log.Printf("Image container updated successfully")
+	mark("thumbnail container update")
 
 	// Automatically copy image to clipboard and paste when it's added to UI
 	log.Printf("Copying captured image to clipboard automatically")
@@ -268,24 +358,30 @@ func (a *AppState) updateCapturedImage(imageData []byte) {
 		log.Printf("Failed to copy image to clipboard: %v", err)
 		setStatusText(a.statusLabel, fmt.Sprintf("Image captured but copy failed: %v", err))
 	} else {
+		mark("xclip image copy")
 		log.Printf("Image copied to clipboard successfully")
 		setStatusText(a.statusLabel, "Image captured")
 
 		// Broadcast image via WebSocket (base64)
+		tB64 := time.Now()
 		base64Image := base64.StdEncoding.EncodeToString(imageData)
 		a.wsServer.Broadcast("image_update", map[string]string{
 			"image":  base64Image,
 			"format": "png",
 		})
+		log.Printf("PERF [post #%d] base64+ws broadcast: +%dms (total %dms)", captureNum, time.Since(tB64).Milliseconds(), time.Since(t0).Milliseconds())
+		mark("ws broadcast")
 
-		// Small delay and then simulate Ctrl+V to paste image
-		time.Sleep(200 * time.Millisecond)
+		// Minimal delay and then simulate Ctrl+V to paste image
+		time.Sleep(50 * time.Millisecond)
 		log.Printf("Simulating Ctrl+V to paste image...")
 		robotgo.KeyDown("control")
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 		robotgo.KeyTap("v")
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 		robotgo.KeyUp("control")
+		mark("paste simulation")
+		log.Printf("PERF [post #%d] total: %dms, %s", captureNum, time.Since(t0).Milliseconds(), perfState())
 	}
 }
 
@@ -477,14 +573,14 @@ func (c *imageEditorCanvas) MouseDragged(ev *desktop.MouseEvent) {
 }
 
 func (c *imageEditorCanvas) CreateRenderer() fyne.WidgetRenderer {
-	// Create initial image with arrows
+	// Create initial image with arrows (raster only, no PNG round-trip)
 	log.Printf("Creating renderer for image editor canvas, image bounds: %v", c.baseImage.Bounds())
-	imgData := c.drawImageWithArrows()
-	log.Printf("Image data size: %d bytes", len(imgData))
-	resource := fyne.NewStaticResource("canvas.png", imgData)
-	imgObj := canvas.NewImageFromResource(resource)
-	imgObj.FillMode = canvas.ImageFillOriginal
+	tDraw := time.Now()
+	raster := c.drawImageRaster()
+	log.Printf("PERF [editor #%d] first draw (raster): %dms", perfCurNum(), time.Since(tDraw).Milliseconds())
 	bounds := c.baseImage.Bounds()
+	imgObj := canvas.NewImageFromImage(raster)
+	imgObj.FillMode = canvas.ImageFillOriginal
 	imgObj.SetMinSize(fyne.NewSize(float32(bounds.Dx()), float32(bounds.Dy())))
 
 	return &imageEditorCanvasRenderer{
@@ -493,7 +589,11 @@ func (c *imageEditorCanvas) CreateRenderer() fyne.WidgetRenderer {
 	}
 }
 
-func (c *imageEditorCanvas) drawImageWithArrows() []byte {
+// drawImageRaster composites the base image and all arrows into a fresh RGBA.
+// No PNG encoding here: the interactive refresh used to PNG-encode the whole
+// image (and Fyne then re-decoded it) on every mouse-drag frame, which made
+// drawing on the screenshot visibly laggy.
+func (c *imageEditorCanvas) drawImageRaster() *image.RGBA {
 	bounds := c.baseImage.Bounds()
 	rgba := image.NewRGBA(bounds)
 	draw.Draw(rgba, bounds, c.baseImage, bounds.Min, draw.Src)
@@ -509,6 +609,13 @@ func (c *imageEditorCanvas) drawImageWithArrows() []byte {
 			c.currentArrow.EndX, c.currentArrow.EndY)
 	}
 
+	return rgba
+}
+
+// drawImageWithArrows returns the composited image PNG-encoded (used for saving).
+func (c *imageEditorCanvas) drawImageWithArrows() []byte {
+	rgba := c.drawImageRaster()
+
 	// Encode to PNG
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, rgba); err != nil {
@@ -519,11 +626,17 @@ func (c *imageEditorCanvas) drawImageWithArrows() []byte {
 }
 
 type imageEditorCanvasRenderer struct {
-	canvas *imageEditorCanvas
-	imgObj *canvas.Image
+	canvas            *imageEditorCanvas
+	imgObj            *canvas.Image
+	firstLayoutLogged bool
 }
 
 func (r *imageEditorCanvasRenderer) Layout(size fyne.Size) {
+	if !r.firstLayoutLogged {
+		r.firstLayoutLogged = true
+		log.Printf("PERF [editor #%d] first paint (layout on render thread): open stage %dms (capture→%s)",
+			perfCurNum(), perfStageMs(atomic.LoadInt64(&perfEditorOpenNanos)), perfAge())
+	}
 	// Center image in container
 	bounds := r.canvas.baseImage.Bounds()
 	imgWidth := float32(bounds.Dx())
@@ -552,75 +665,149 @@ func (r *imageEditorCanvasRenderer) Objects() []fyne.CanvasObject {
 }
 
 func (r *imageEditorCanvasRenderer) Refresh() {
-	// Redraw image with arrows
-	imgData := r.canvas.drawImageWithArrows()
-	resource := fyne.NewStaticResource("canvas.png", imgData)
-	r.imgObj.Resource = resource
+	// Redraw image with arrows (raster only — no PNG round-trip, see drawImageRaster)
+	tDraw := time.Now()
+	r.imgObj.Image = r.canvas.drawImageRaster()
 	r.imgObj.Refresh()
+	if d := time.Since(tDraw); d >= 30*time.Millisecond {
+		log.Printf("PERF [editor #%d] slow refresh (raster): %dms", perfCurNum(), d.Milliseconds())
+	}
 }
 
 func (r *imageEditorCanvasRenderer) Destroy() {
 }
 
+// drawArrow draws an anti-aliased red arrow (smooth stroke + filled head) onto img.
+// Instead of stamping whole pixels step by step, every pixel in the arrow's bounding
+// box receives subpixel coverage from analytic distance fields, so edges stay smooth
+// at any angle.
 func drawArrow(img *image.RGBA, x1, y1, x2, y2 int) {
+	const (
+		strokeHalf = 1.5  // half of the stroke width (3px line)
+		headLen    = 20.0 // arrowhead length in pixels
+		headHalf   = 8.0  // half of the arrowhead base (16px wide)
+	)
+
 	red := color.RGBA{R: 255, G: 0, B: 0, A: 255}
 
-	// Draw line
-	drawLine(img, x1, y1, x2, y2, red, 2)
+	ax, ay := float64(x1), float64(y1)
+	tipX, tipY := float64(x2), float64(y2)
 
-	// Draw arrowhead
-	drawArrowhead(img, x1, y1, x2, y2, red)
-}
-
-func drawLine(img *image.RGBA, x1, y1, x2, y2 int, c color.Color, width int) {
-	dx := x2 - x1
-	dy := y2 - y1
-	steps := int(math.Max(math.Abs(float64(dx)), math.Abs(float64(dy))))
-
-	if steps == 0 {
+	dx, dy := tipX-ax, tipY-ay
+	length := math.Hypot(dx, dy)
+	if length < 2 { // ignore stray single clicks
 		return
 	}
+	ux, uy := dx/length, dy/length // unit vector along the arrow
+	px, py := -uy, ux              // unit perpendicular
 
-	for i := 0; i <= steps; i++ {
-		t := float64(i) / float64(steps)
-		x := int(float64(x1) + float64(dx)*t)
-		y := int(float64(y1) + float64(dy)*t)
+	// Head: filled triangle with the tip at (x2, y2)
+	baseX, baseY := tipX-ux*headLen, tipY-uy*headLen
+	h1x, h1y := baseX+px*headHalf, baseY+py*headHalf
+	h2x, h2y := baseX-px*headHalf, baseY-py*headHalf
 
-		// Draw with width
-		for wx := -width / 2; wx <= width/2; wx++ {
-			for wy := -width / 2; wy <= width/2; wy++ {
-				if x+wx >= 0 && x+wx < img.Bounds().Dx() && y+wy >= 0 && y+wy < img.Bounds().Dy() {
-					img.Set(x+wx, y+wy, c)
-				}
+	// Stroke runs from the tail into the head base (small overlap hides the seam)
+	endX, endY := baseX+ux*2, baseY+uy*2
+
+	// Bounding box of the whole arrow, with a feather margin
+	minX := int(math.Floor(math.Min(math.Min(ax, tipX), math.Min(h1x, h2x)) - strokeHalf - 1))
+	maxX := int(math.Ceil(math.Max(math.Max(ax, tipX), math.Max(h1x, h2x)) + strokeHalf + 1))
+	minY := int(math.Floor(math.Min(math.Min(ay, tipY), math.Min(h1y, h2y)) - strokeHalf - 1))
+	maxY := int(math.Ceil(math.Max(math.Max(ay, tipY), math.Max(h1y, h2y)) + strokeHalf + 1))
+
+	bounds := img.Bounds()
+	if minX < bounds.Min.X {
+		minX = bounds.Min.X
+	}
+	if minY < bounds.Min.Y {
+		minY = bounds.Min.Y
+	}
+	if maxX > bounds.Max.X-1 {
+		maxX = bounds.Max.X - 1
+	}
+	if maxY > bounds.Max.Y-1 {
+		maxY = bounds.Max.Y - 1
+	}
+
+	for y := minY; y <= maxY; y++ {
+		for x := minX; x <= maxX; x++ {
+			// Pixel center in image coordinates
+			fx, fy := float64(x)+0.5, float64(y)+0.5
+
+			// Round-capped stroke (capsule) coverage
+			cov := clamp01(strokeHalf - distToSegment(fx, fy, ax, ay, endX, endY) + 0.5)
+
+			// Filled head coverage
+			if t := triangleCoverage(fx, fy, tipX, tipY, h1x, h1y, h2x, h2y); t > cov {
+				cov = t
+			}
+
+			if cov > 0 {
+				blendPixelCoverage(img, x, y, red, cov)
 			}
 		}
 	}
 }
 
-func drawArrowhead(img *image.RGBA, x1, y1, x2, y2 int, c color.Color) {
-	// Calculate angle
-	dx := float64(x2 - x1)
-	dy := float64(y2 - y1)
-	angle := math.Atan2(dy, dx)
+// distToSegment returns the distance from point (px, py) to segment (ax, ay)-(bx, by).
+func distToSegment(px, py, ax, ay, bx, by float64) float64 {
+	dx, dy := bx-ax, by-ay
+	l2 := dx*dx + dy*dy
+	if l2 == 0 {
+		return math.Hypot(px-ax, py-ay)
+	}
+	t := ((px-ax)*dx + (py-ay)*dy) / l2
+	if t < 0 {
+		t = 0
+	} else if t > 1 {
+		t = 1
+	}
+	return math.Hypot(px-(ax+dx*t), py-(ay+dy*t))
+}
 
-	// Arrowhead size
-	size := 15.0
+// triangleCoverage returns anti-aliased coverage (0..1) of the point inside triangle abc.
+// Distance to the nearest edge is feathered over one pixel; sharp corners get slightly
+// rounded by the same distance field.
+func triangleCoverage(px, py, ax, ay, bx, by, cx, cy float64) float64 {
+	d1 := edgeDistance(px, py, ax, ay, bx, by, cx, cy)
+	d2 := edgeDistance(px, py, bx, by, cx, cy, ax, ay)
+	d3 := edgeDistance(px, py, cx, cy, ax, ay, bx, by)
+	return clamp01(math.Min(d1, math.Min(d2, d3)) + 0.5)
+}
 
-	// Calculate arrowhead points
-	arrowAngle := math.Pi / 6 // 30 degrees
+// edgeDistance returns the signed distance from point p to line a-b; positive on the
+// side of the reference point c (inside the triangle by construction).
+func edgeDistance(px, py, ax, ay, bx, by, cx, cy float64) float64 {
+	ex, ey := bx-ax, by-ay
+	length := math.Hypot(ex, ey)
+	if length == 0 {
+		return math.Hypot(px-ax, py-ay)
+	}
+	d := (ex*(py-ay) - ey*(px-ax)) / length
+	if ex*(cy-ay)-ey*(cx-ax) < 0 {
+		d = -d
+	}
+	return d
+}
 
-	// Point 1
-	px1 := x2 - int(size*math.Cos(angle-arrowAngle))
-	py1 := y2 - int(size*math.Sin(angle-arrowAngle))
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
 
-	// Point 2
-	px2 := x2 - int(size*math.Cos(angle+arrowAngle))
-	py2 := y2 - int(size*math.Sin(angle+arrowAngle))
-
-	// Draw arrowhead triangle
-	drawLine(img, x2, y2, px1, py1, c, 2)
-	drawLine(img, x2, y2, px2, py2, c, 2)
-	drawLine(img, px1, py1, px2, py2, c, 2)
+// blendPixelCoverage composites color c over the pixel with the given coverage.
+func blendPixelCoverage(img *image.RGBA, x, y int, c color.RGBA, cov float64) {
+	i := img.PixOffset(x, y)
+	inv := 1 - cov
+	img.Pix[i] = uint8(float64(c.R)*cov + float64(img.Pix[i])*inv + 0.5)
+	img.Pix[i+1] = uint8(float64(c.G)*cov + float64(img.Pix[i+1])*inv + 0.5)
+	img.Pix[i+2] = uint8(float64(c.B)*cov + float64(img.Pix[i+2])*inv + 0.5)
+	img.Pix[i+3] = 255
 }
 
 // closeAllImageEditorWindows closes all open image editor windows
@@ -629,6 +816,7 @@ func closeAllImageEditorWindows(appState *AppState) {
 	if currentApp == nil {
 		return
 	}
+	windowsBefore := len(currentApp.Driver().AllWindows())
 
 	// First, close the window stored in AppState if it exists
 	if appState != nil && appState.imageEditorWindow != nil {
@@ -638,30 +826,18 @@ func closeAllImageEditorWindows(appState *AppState) {
 		// Clear CloseIntercept to avoid recursion and issues
 		windowToClose.SetCloseIntercept(nil)
 		windowToClose.Close()
-		// Small delay to ensure window is closed
-		time.Sleep(50 * time.Millisecond)
 	}
 
 	// Close all windows with title "Editor" (editor windows)
 	// Get all windows and close those that are editor windows
 	allWindows := currentApp.Driver().AllWindows()
-	editorWindowsToClose := make([]fyne.Window, 0)
-
 	for _, window := range allWindows {
 		if window != nil && window.Title() == "Editor" {
 			log.Printf("Found image editor window to close: %s", window.Title())
-			editorWindowsToClose = append(editorWindowsToClose, window)
+			// Clear CloseIntercept to avoid recursion
+			window.SetCloseIntercept(nil)
+			window.Close()
 		}
-	}
-
-	// Close all found editor windows
-	for _, window := range editorWindowsToClose {
-		log.Printf("Closing image editor window: %s", window.Title())
-		// Clear CloseIntercept to avoid recursion
-		window.SetCloseIntercept(nil)
-		window.Close()
-		// Small delay between closing windows
-		time.Sleep(50 * time.Millisecond)
 	}
 
 	// Final check: clear AppState reference if it still points to something
@@ -679,6 +855,11 @@ func closeAllImageEditorWindows(appState *AppState) {
 			appState.imageEditorWindow = nil
 		}
 	}
+
+	windowsAfter := len(currentApp.Driver().AllWindows())
+	if windowsAfter != windowsBefore {
+		log.Printf("Editor windows: %d before close → %d after (open now: %v)", windowsBefore, windowsAfter, windowTitles())
+	}
 }
 
 // openImageEditor opens a new window with image editor
@@ -688,7 +869,12 @@ func openImageEditor(imageData []byte) {
 
 // openImageEditorWithAppState opens a new window with image editor and saves to AppState
 func openImageEditorWithAppState(imageData []byte, appState *AppState) {
-	log.Printf("openImageEditorWithAppState called, image size: %d bytes", len(imageData))
+	captureNum := perfCurNum()
+	editorOpenNanos := time.Now().UnixNano()
+	atomic.StoreInt64(&perfEditorOpenNanos, editorOpenNanos)
+	atomic.StoreInt32(&perfEditorClosed, 0)
+	t0 := time.Now()
+	log.Printf("PERF [editor #%d] open: %d bytes, %s", captureNum, len(imageData), perfState())
 	// Use existing app instead of creating new one
 	currentApp := fyne.CurrentApp()
 	if currentApp == nil {
@@ -698,6 +884,7 @@ func openImageEditorWithAppState(imageData []byte, appState *AppState) {
 
 	log.Printf("Creating new editor window")
 	editorWindow := currentApp.NewWindow("Editor")
+	log.Printf("PERF [editor #%d] NewWindow: %dms", captureNum, time.Since(t0).Milliseconds())
 
 	// Store reference to editor window in AppState if provided
 	if appState != nil {
@@ -709,6 +896,7 @@ func openImageEditorWithAppState(imageData []byte, appState *AppState) {
 		log.Printf("Failed to create image editor canvas: %v", err)
 		return
 	}
+	log.Printf("PERF [editor #%d] decode image + canvas: %dms", captureNum, time.Since(t0).Milliseconds())
 
 	// Get image bounds
 	bounds := canvasWidget.baseImage.Bounds()
@@ -758,20 +946,44 @@ func openImageEditorWithAppState(imageData []byte, appState *AppState) {
 	// Wrap everything in a Stack to overlay the indicator on top of the image
 	mainStack := container.NewStack(canvasContainer, indicatorOverlay)
 	editorWindow.SetContent(mainStack)
+	log.Printf("PERF [editor #%d] SetContent: %dms", captureNum, time.Since(t0).Milliseconds())
 
-	// Use a goroutine to position the indicator after the window is shown and layout is calculated
-	go func() {
-		for i := 0; i < 20; i++ {
-			time.Sleep(100 * time.Millisecond)
+	// Wait (cheaply) until the window is actually mapped, then position the
+	// recording indicator. The previous version polled every 100ms and forced a
+	// full-stack refresh 20 times over 2s; each forced refresh re-encoded the
+	// image to PNG and re-uploaded its texture — exactly the "editor feels slow"
+	// symptom. Refreshes are cheap now, but we still only do one.
+	goSafe("editor-open-monitor", func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if atomic.LoadInt32(&perfEditorClosed) == 1 {
+				log.Printf("PERF [editor #%d] closed before it became visible", captureNum)
+				return
+			}
 			size := editorWindow.Canvas().Size()
-			if size.Width > 0 {
+			if size.Width > 0 && size.Height > 0 {
+				captureToVisible := perfAgeMs()
+				openToVisible := time.Since(t0).Milliseconds()
+				log.Printf("PERF [editor #%d] WINDOW VISIBLE: open=%dms (capture→visible=%s) state: %s",
+					captureNum, openToVisible, perfAge(), perfState())
+				if captureToVisible > 800 {
+					log.Printf("⚠ SLOW [editor #%d] capture→visible took %dms", captureNum, captureToVisible)
+				}
+				if captureToVisible > 1500 {
+					crashf("SLOW editor open: capture→visible=%dms (window stage=%dms, open→visible=%dms, %s)",
+						captureToVisible, perfStageMs(editorOpenNanos), openToVisible, perfState())
+				}
 				posX := (size.Width - 30) / 2
 				recordingIndicator.Move(fyne.NewPos(posX, 10))
 				recordingIndicator.Refresh()
-				editorWindow.Canvas().Refresh(mainStack) // Force refresh of the whole stack
+				editorWindow.Canvas().Refresh(mainStack) // single refresh: indicator position
+				return
 			}
+			time.Sleep(10 * time.Millisecond)
 		}
-	}()
+		log.Printf("⚠ SLOW [editor #%d] window STILL not visible after 5s (%s)", captureNum, perfState())
+		crashf("editor window did not become visible within 5s — window mapping/render stall (%s)", perfState())
+	})
 
 	// Add Escape key handler to close window without saving
 	// Add W key handler to close window and save image
@@ -779,6 +991,7 @@ func openImageEditorWithAppState(imageData []byte, appState *AppState) {
 	editorWindow.Canvas().SetOnTypedKey(func(event *fyne.KeyEvent) {
 		log.Printf("Image Editor: Key pressed: %v", event.Name)
 		if event.Name == fyne.KeyEscape {
+			atomic.StoreInt32(&perfEditorClosed, 1)
 			log.Printf("Escape pressed in image editor, closing window without saving")
 			// If recording, stop it
 			if appState != nil && appState.isRecording {
@@ -809,6 +1022,7 @@ func openImageEditorWithAppState(imageData []byte, appState *AppState) {
 				}
 			}
 		} else if event.Name == fyne.KeyW {
+			atomic.StoreInt32(&perfEditorClosed, 1)
 			log.Printf("W key detected in image editor, closing window and saving image")
 
 			// If recording, stop it and process
@@ -842,6 +1056,7 @@ func openImageEditorWithAppState(imageData []byte, appState *AppState) {
 
 	// Clear reference when window is closed (for Escape key or window close button)
 	editorWindow.SetCloseIntercept(func() {
+		atomic.StoreInt32(&perfEditorClosed, 1)
 		// If recording, stop it
 		if appState != nil && appState.isRecording {
 			log.Printf("Closing editor: stopping active recording")
@@ -857,6 +1072,9 @@ func openImageEditorWithAppState(imageData []byte, appState *AppState) {
 	// The canvas widget implements desktop.Mouseable interface
 	// Fyne will automatically call MouseDown, MouseUp, MouseDragged methods
 
+	tShow := time.Now()
 	editorWindow.Show()
+	log.Printf("PERF [editor #%d] Show() returned: %dms (open so far %dms, capture→%s)",
+		captureNum, time.Since(tShow).Milliseconds(), time.Since(t0).Milliseconds(), perfAge())
 	// Don't call Run() - the main app is already running
 }

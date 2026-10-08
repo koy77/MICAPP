@@ -21,6 +21,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -83,11 +84,18 @@ type Change struct {
 	Description string `json:"description"`
 }
 
-// NewLLMClient creates a new LLM client for text correction
+// NewLLMClient creates a new LLM client for text correction.
+// Text correction is optional: a missing OPENAI_API_KEY only disables it
+// (transcription can run on a different provider, e.g. Groq).
 func NewLLMClient() (*LLMClient, error) {
-	apiKey := os.Getenv("OPENAI_API_KEY")
+	apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
 	if apiKey == "" {
-		return nil, fmt.Errorf("OPENAI_API_KEY environment variable is not set")
+		log.Printf("LLM text correction disabled: OPENAI_API_KEY is not set")
+		return &LLMClient{
+			client: &http.Client{
+				Timeout: 30 * time.Second,
+			},
+		}, nil
 	}
 
 	return &LLMClient{
@@ -100,6 +108,10 @@ func NewLLMClient() (*LLMClient, error) {
 
 // CorrectText sends transcribed text to OpenAI's GPT API for correction and improvement
 func (c *LLMClient) CorrectText(transcribedText string) (string, error) {
+	if c.apiKey == "" {
+		return "", fmt.Errorf("text correction is disabled: OPENAI_API_KEY is not set")
+	}
+
 	// Create the correction prompt with JSON format specification
 	prompt := fmt.Sprintf(`Please correct and improve the following transcribed text. Fix any grammar errors, punctuation, capitalization, and make it more readable while preserving the original meaning.
 

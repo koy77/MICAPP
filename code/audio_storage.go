@@ -20,6 +20,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -120,8 +122,8 @@ func (as *AudioStorage) StoreAudio(pcmData []byte, sampleRate uint32) ([]AudioFi
 	return storedFiles, nil
 }
 
-// SaveLastRecording saves the recording as MP3 128kbps to the recordings folder
-func (as *AudioStorage) SaveLastRecording(pcmData []byte, sampleRate uint32) (string, error) {
+// SaveLastRecording saves the recording as MP3 128kbps to the recordings folder and returns the MP3 data
+func (as *AudioStorage) SaveLastRecording(pcmData []byte, sampleRate uint32) (string, []byte, error) {
 	timestamp := time.Now()
 	baseFilename := fmt.Sprintf("recording_%s", timestamp.Format("20060102_150405"))
 
@@ -131,12 +133,12 @@ func (as *AudioStorage) SaveLastRecording(pcmData []byte, sampleRate uint32) (st
 
 	mp3Data, err := as.convertPCMToMP3(pcmData, sampleRate, 128)
 	if err != nil {
-		return "", fmt.Errorf("failed to convert to MP3: %v", err)
+		return "", nil, fmt.Errorf("failed to convert to MP3: %v", err)
 	}
 
 	err = os.WriteFile(mp3Filepath, mp3Data, 0644)
 	if err != nil {
-		return "", fmt.Errorf("failed to write MP3 file: %v", err)
+		return "", nil, fmt.Errorf("failed to write MP3 file: %v", err)
 	}
 
 	// Verify MP3 file was written correctly
@@ -150,7 +152,7 @@ func (as *AudioStorage) SaveLastRecording(pcmData []byte, sampleRate uint32) (st
 	// Rotate recordings to keep only the last 10
 	as.RotateRecordings(10)
 
-	return mp3Filename, nil
+	return mp3Filename, mp3Data, nil
 }
 
 // RotateRecordings keeps only the N most recent recordings and deletes the rest
@@ -264,7 +266,45 @@ func (as *AudioStorage) convertPCMToMP3(pcmData []byte, sampleRate uint32, bitra
 	return mp3Data, nil
 }
 
-// GetStoredAudioFiles returns all stored audio files
+// getMP3Duration returns the duration of an MP3 file in seconds using ffprobe
+func (as *AudioStorage) getMP3Duration(filePath string) float64 {
+	cmd := exec.Command("ffprobe",
+		"-v", "quiet",
+		"-show_entries", "format=duration",
+		"-of", "csv=p=0",
+		filePath,
+	)
+	output, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	secs, err := strconv.ParseFloat(strings.TrimSpace(string(output)), 64)
+	if err != nil {
+		return 0
+	}
+	return secs
+}
+
+// getMP3Bitrate returns the bitrate of an MP3 file in kbps using ffprobe
+func (as *AudioStorage) getMP3Bitrate(filePath string) int {
+	cmd := exec.Command("ffprobe",
+		"-v", "quiet",
+		"-show_entries", "format=bit_rate",
+		"-of", "csv=p=0",
+		filePath,
+	)
+	output, err := cmd.Output()
+	if err != nil {
+		return 128
+	}
+	bitrate, err := strconv.Atoi(strings.TrimSpace(string(output)))
+	if err != nil || bitrate <= 0 {
+		return 128
+	}
+	return bitrate / 1000 // Convert bps to kbps
+}
+
+// GetStoredAudioFiles returns all stored audio files with proper metadata
 func (as *AudioStorage) GetStoredAudioFiles() ([]AudioFile, error) {
 	files, err := os.ReadDir(as.baseDir)
 	if err != nil {
@@ -279,20 +319,31 @@ func (as *AudioStorage) GetStoredAudioFiles() ([]AudioFile, error) {
 				continue
 			}
 
-			// Parse filename to extract metadata
-			audioFile := AudioFile{
-				Filename:  file.Name(),
-				Timestamp: fileInfo.ModTime(),
-				Size:      fileInfo.Size(),
+			fullPath := filepath.Join(as.baseDir, file.Name())
+			durationSec := as.getMP3Duration(fullPath)
+			bitrate := as.getMP3Bitrate(fullPath)
+
+			// Parse bitrate from filename if present (e.g., recording_XXX_128kbps.mp3)
+			name := file.Name()
+			if idx := strings.Index(name, "_kbps"); idx > 0 {
+				// Try to extract number before _kbps
+				start := idx
+				for start > 0 && name[start-1] >= '0' && name[start-1] <= '9' {
+					start--
+				}
+				if parsed, err := strconv.Atoi(name[start:idx]); err == nil && parsed > 0 {
+					bitrate = parsed
+				}
 			}
 
-			// Extract bitrate from filename (simplified)
-			if len(file.Name()) > 10 {
-				// Assume format: recording_YYYYMMDD_HHMMSS_XXXkbps.mp3
-				audioFile.Bitrate = 128 // Default, would parse from filename in real implementation
-			}
-
-			audioFiles = append(audioFiles, audioFile)
+			audioFiles = append(audioFiles, AudioFile{
+				Filename:   file.Name(),
+				Bitrate:    bitrate,
+				SampleRate: 16000,
+				Duration:   time.Duration(durationSec * float64(time.Second)),
+				Timestamp:  fileInfo.ModTime(),
+				Size:       fileInfo.Size(),
+			})
 		}
 	}
 
@@ -308,4 +359,42 @@ func (as *AudioStorage) DeleteAudioFile(filename string) error {
 // GetAudioFilePath returns the full path to an audio file
 func (as *AudioStorage) GetAudioFilePath(filename string) string {
 	return filepath.Join(as.baseDir, filename)
+}
+
+// GetLastRecordingData returns the data and filename of the most recent recording
+func (as *AudioStorage) GetLastRecordingData() (string, []byte, error) {
+	files, err := os.ReadDir(as.baseDir)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to read recordings directory: %v", err)
+	}
+
+	var lastFile os.DirEntry
+	var lastTime time.Time
+
+	for _, f := range files {
+		if f.IsDir() || filepath.Ext(f.Name()) != ".mp3" {
+			continue
+		}
+		info, err := f.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(lastTime) {
+			lastTime = info.ModTime()
+			lastFile = f
+		}
+	}
+
+	if lastFile == nil {
+		return "", nil, fmt.Errorf("no recordings found")
+	}
+
+	filePath := filepath.Join(as.baseDir, lastFile.Name())
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to read recording file: %v", err)
+	}
+
+	log.Printf("Loaded last recording: %s (%d bytes)", lastFile.Name(), len(data))
+	return lastFile.Name(), data, nil
 }

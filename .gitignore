@@ -37,3 +37,8 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+
+# Runtime state / local backups
+.micapp.session
+micapp.bak-*
+/micapp
